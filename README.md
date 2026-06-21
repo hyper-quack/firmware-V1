@@ -335,3 +335,4 @@ what the `OK / FAIL` + `WHO_AM_I=0x..` lines above tell you. Until **both** repo
 - [ ] Swap busy-wait CDC logging for a defmt-over-RTT or framed binary link.
 ```
 # firmware-V1
+# firmware-V1
