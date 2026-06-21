@@ -1,0 +1,1 @@
+stm32h7xx_hal::gpio::Pin<'A', 4, stm32h7xx_hal::gpio::Output>: embedded_hal::digital::OutputPin

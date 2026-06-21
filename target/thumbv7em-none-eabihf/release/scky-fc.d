@@ -1,0 +1,1 @@
+/home/poorcsky/Documents/scky_firmware/target/thumbv7em-none-eabihf/release/scky-fc: /home/poorcsky/Documents/scky_firmware/build.rs /home/poorcsky/Documents/scky_firmware/memory.x /home/poorcsky/Documents/scky_firmware/src/imu.rs /home/poorcsky/Documents/scky_firmware/src/main.rs

@@ -1,0 +1,1 @@
+&mut Imu<stm32h7xx_hal::spi::Spi<stm32h7xx_hal::stm32::SPI4, stm32h7xx_hal::spi::Enabled>, stm32h7xx_hal::gpio::Pin<'B', 1, stm32h7xx_hal::gpio::Output>>

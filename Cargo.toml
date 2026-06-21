@@ -1,0 +1,58 @@
+[package]
+name = "scky-fc"
+version = "0.1.0"
+edition = "2021"
+authors = ["scky"]
+description = "RTIC flight-controller firmware for the DAKEFPVH743 (STM32H743) board"
+license = "MIT OR Apache-2.0"
+
+# ---------------------------------------------------------------------------
+# Single binary: the flight-controller firmware.
+# ---------------------------------------------------------------------------
+[[bin]]
+name = "scky-fc"
+test = false
+bench = false
+
+[dependencies]
+# Core runtime ------------------------------------------------------------
+cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7.3"
+
+# RTIC v2 + Systick monotonic --------------------------------------------
+rtic = { version = "2.1", features = ["thumbv7-backend"] }
+rtic-monotonics = { version = "2.0", features = ["cortex-m-systick"] }
+
+# HAL / PAC for the STM32H743 --------------------------------------------
+# `stm32h743v` = H743 silicon revision V (the one on this board).
+# `usb_hs`     = OTG1_HS controller, used here in full-speed (internal PHY).
+stm32h7xx-hal = { version = "0.16", features = ["stm32h743v", "rt", "usb_hs"] }
+
+# embedded-hal 0.2 traits (blocking SPI Transfer, OutputPin v2) — this is the
+# version stm32h7xx-hal 0.16 implements, so the IMU driver targets it too.
+embedded-hal = "0.2.7"
+
+# USB CDC-ACM stack -------------------------------------------------------
+usb-device = "0.3"
+usbd-serial = "0.2"
+
+# Utilities ---------------------------------------------------------------
+libm = "0.2"          # atan2f/sqrtf for roll/pitch from the gravity vector
+heapless = "0.8"
+panic-halt = "0.2"
+nb = "1"
+
+# ---------------------------------------------------------------------------
+# Always build the firmware optimised. Debug builds of an FPU/CMSIS workload
+# are far too slow and the binary will not fit comfortably otherwise.
+# ---------------------------------------------------------------------------
+[profile.dev]
+opt-level = 1
+debug = true
+lto = false
+
+[profile.release]
+opt-level = "s"
+debug = true        # keep symbols for probe-rs / defmt; stripped from .bin
+lto = "fat"
+codegen-units = 1

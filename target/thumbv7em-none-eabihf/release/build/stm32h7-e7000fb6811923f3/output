@@ -1,0 +1,3 @@
+cargo:rustc-link-search=/home/poorcsky/Documents/scky_firmware/target/thumbv7em-none-eabihf/release/build/stm32h7-e7000fb6811923f3/out
+cargo:rerun-if-changed=src/stm32h743v/device.x
+cargo:rerun-if-changed=build.rs

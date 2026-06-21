@@ -1,0 +1,15 @@
+# Build for the Cortex-M7F (hardware double-precision FPU) core in the H743.
+[build]
+target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
+# Flash + run over SWD with a debug probe (ST-Link, J-Link, CMSIS-DAP, ...).
+# Requires: cargo install probe-rs-tools
+runner = "probe-rs run --chip STM32H743VITx"
+
+rustflags = [
+    "-C", "link-arg=-Tlink.x",   # cortex-m-rt linker script
+]
+
+[env]
+DEFMT_LOG = "info"
