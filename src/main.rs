@@ -13,7 +13,7 @@
 //! Task / priority layout (higher number = higher priority):
 //!   prio 3  imu1_task / imu2_task   1 kHz sampling + per-IMU low-pass filtering
 //!   prio 2  estimator              1 kHz sensor fusion (Mahony attitude filter)
-//!   prio 1  usb_task               USB poll + ~10 Hz telemetry / 1 Hz heartbeat
+//!   prio 1  usb_task               USB poll + 20 Hz/IMU MAVLink / 1 Hz status
 //!
 //! The sensor-fusion pipeline (filters -> dual-IMU combine -> attitude filter)
 //! is documented in `docs/sensor-fusion.md`.
@@ -25,6 +25,7 @@ mod ahrs;
 mod estimator;
 mod filters;
 mod imu;
+mod mavlink;
 
 use panic_halt as _;
 
@@ -41,9 +42,7 @@ systick_monotonic!(Mono, 1000);
 mod app {
     use super::*;
 
-    use core::fmt::Write as _;
     use embedded_hal::spi::MODE_3;
-    use heapless::String;
     use stm32h7xx_hal::gpio::{Output, Pin};
     use stm32h7xx_hal::prelude::*;
     use stm32h7xx_hal::rcc::rec::{Spi123ClkSel, UsbClkSel};
@@ -55,6 +54,7 @@ mod app {
     use crate::estimator::{Estimator, Rotation};
     use crate::filters::ImuLpf;
     use crate::imu::{Health, Imu, ImuOut};
+    use crate::mavlink::{Encoder, MAV_SYS_STATUS_SENSOR_3D_ACCEL, MAV_SYS_STATUS_SENSOR_3D_GYRO};
 
     // ---- Fusion tuning ----------------------------------------------------
     /// Tasks tick at 1 kHz (Systick monotonic), so the filter sample rate and
@@ -93,6 +93,7 @@ mod app {
         // writes telemetry — so there is no cross-task locking on USB at all.
         usb_dev: UsbDevice<'static, MyUsbBus>,
         serial: usbd_serial::SerialPort<'static, MyUsbBus>,
+        mavlink: Encoder,
     }
 
     #[init]
@@ -119,8 +120,7 @@ mod app {
         // enabled by this clock configuration, so leaving the reset selection
         // makes `SPI1.spi(...)` panic and halt before USB can enumerate.
         // `per_ck` is sourced from the running HSI clock and is always present.
-        ccdr.peripheral
-            .kernel_spi123_clk_mux(Spi123ClkSel::Per);
+        ccdr.peripheral.kernel_spi123_clk_mux(Spi123ClkSel::Per);
 
         // --- Systick monotonic @ 1 kHz -------------------------------------
         Mono::start(cp.SYST, 64_000_000);
@@ -228,6 +228,7 @@ mod app {
                 est,
                 usb_dev,
                 serial,
+                mavlink: Encoder::new(),
             },
         )
     }
@@ -302,17 +303,15 @@ mod app {
     }
 
     /// Owns the whole USB stack: polls it at ~1 kHz (keeps enumeration alive and
-    /// flushes the IN endpoint) and streams human-readable telemetry. Lowest
+    /// flushes the IN endpoint) and streams MAVLink 2 telemetry. Lowest
     /// priority, so it can never delay the IMU sampling tasks.
-    #[task(priority = 1, local = [usb_dev, serial], shared = [out1, out2, att])]
+    #[task(priority = 1, local = [usb_dev, serial, mavlink], shared = [out1, out2])]
     async fn usb_task(cx: usb_task::Context) {
         let usb_dev = cx.local.usb_dev;
         let serial = cx.local.serial;
+        let mavlink = cx.local.mavlink;
         let usb_task::SharedResources {
-            mut out1,
-            mut out2,
-            mut att,
-            ..
+            mut out1, mut out2, ..
         } = cx.shared;
 
         let mut tick: u32 = 0;
@@ -325,47 +324,65 @@ mod app {
                 let _ = serial.read(&mut scratch);
             }
 
-            // Only write when fully configured — skip (and don't count the tick)
-            // until the host has completed enumeration.
+            // Only write when fully configured; timekeeping continues while the
+            // host is absent so MAVLink timestamps remain time-since-boot.
             if usb_dev.state() != usb_device::device::UsbDeviceState::Configured {
+                tick = tick.wrapping_add(1);
                 Mono::delay(1.millis()).await;
                 continue;
             }
 
-            // Fused attitude ~10 Hz (slow enough to read comfortably in a
-            // terminal; the estimator itself still runs at 1 kHz).
-            if tick % 100 == 0 {
-                let a = att.lock(|x| *x);
-                let mut line: String<200> = String::new();
-                let _ = write!(
-                    line,
-                    "ATT roll={:+7.1} pitch={:+7.1} yaw={:+7.1} deg | \
-                     rate r/p/y={:+7.1}/{:+7.1}/{:+7.1} dps | \
-                     bias={:+5.2}/{:+5.2}/{:+5.2}\r\n",
-                    a.roll, a.pitch, a.yaw,
-                    a.rates[0], a.rates[1], a.rates[2],
-                    a.bias[0], a.bias[1], a.bias[2],
-                );
-                pump_write(usb_dev, serial, line.as_bytes());
+            // Two independent 20 Hz HIGHRES_IMU streams, staggered to avoid a
+            // burst of back-to-back USB writes. IDs are zero-based.
+            if tick % 50 == 0 {
+                let o = out1.lock(|o| *o);
+                if matches!(o.health, Health::Ok(_)) {
+                    let frame = mavlink.highres_imu(
+                        tick as u64 * 1_000,
+                        0,
+                        Rotation::Roll180.apply(o.accel),
+                        Rotation::Roll180.apply(o.gyro),
+                    );
+                    pump_write(usb_dev, serial, frame.as_slice());
+                }
+            }
+            if tick % 50 == 25 {
+                let o = out2.lock(|o| *o);
+                if matches!(o.health, Health::Ok(_)) {
+                    let frame = mavlink.highres_imu(
+                        tick as u64 * 1_000,
+                        1,
+                        Rotation::Pitch180.apply(o.accel),
+                        Rotation::Pitch180.apply(o.gyro),
+                    );
+                    pump_write(usb_dev, serial, frame.as_slice());
+                }
             }
 
-            // Status banner / heartbeat ~1 Hz.
-            if tick % 1000 == 0 {
-                let h1v = out1.lock(|o| o.health);
-                let h2v = out2.lock(|o| o.health);
-                let mut line: String<160> = String::new();
-                let _ = write!(
-                    line,
-                    "[HB up={}s] IMU1={} WHO_AM_I=0x{:02X}({}) IMU2={} WHO_AM_I=0x{:02X}({})\r\n",
-                    tick / 1000,
-                    h1v.name(),
-                    h1v.whoami(),
-                    health_word(&h1v),
-                    h2v.name(),
-                    h2v.whoami(),
-                    health_word(&h2v),
-                );
-                pump_write(usb_dev, serial, line.as_bytes());
+            // Spread 1 Hz status packets across the USB frame.
+            if tick % 1000 == 5 {
+                let frame = mavlink.heartbeat();
+                pump_write(usb_dev, serial, frame.as_slice());
+            }
+            if tick % 1000 == 10 {
+                let h1 = out1.lock(|o| o.health);
+                let h2 = out2.lock(|o| o.health);
+                let any_ok = matches!(h1, Health::Ok(_)) || matches!(h2, Health::Ok(_));
+                let sensors = MAV_SYS_STATUS_SENSOR_3D_ACCEL | MAV_SYS_STATUS_SENSOR_3D_GYRO;
+                let frame = mavlink.sys_status(sensors, if any_ok { sensors } else { 0 });
+                pump_write(usb_dev, serial, frame.as_slice());
+            }
+            if tick % 1000 == 15 {
+                let h = out1.lock(|o| o.health);
+                let ok = matches!(h, Health::Ok(_));
+                let frame = mavlink.imu_status(tick, 0, ok, ok, h.whoami());
+                pump_write(usb_dev, serial, frame.as_slice());
+            }
+            if tick % 1000 == 20 {
+                let h = out2.lock(|o| o.health);
+                let ok = matches!(h, Health::Ok(_));
+                let frame = mavlink.imu_status(tick, 1, ok, ok, h.whoami());
+                pump_write(usb_dev, serial, frame.as_slice());
             }
 
             tick = tick.wrapping_add(1);
@@ -373,18 +390,10 @@ mod app {
         }
     }
 
-    fn health_word(h: &Health) -> &'static str {
-        match h {
-            Health::Ok(_) => "OK",
-            Health::Bad(_) => "FAIL",
-            Health::Unknown => "----",
-        }
-    }
-
-    /// Write a buffer to the CDC IN endpoint in one non-blocking call. Lines
+    /// Write a buffer to the CDC IN endpoint in one non-blocking call. Frames
     /// longer than one USB packet (64 B) are written in a tight loop with a
     /// single poll() between packets; if the endpoint is still busy after
-    /// draining, the remainder is dropped (the next 100 ms interval retries).
+    /// draining, the remainder is dropped (a later frame will resynchronize).
     fn pump_write(
         usb_dev: &mut UsbDevice<'static, MyUsbBus>,
         serial: &mut usbd_serial::SerialPort<'static, MyUsbBus>,

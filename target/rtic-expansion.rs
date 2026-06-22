@@ -7,14 +7,17 @@
     #[doc =
     r" Holds the maximum priority level for use by async HAL drivers."]
     #[no_mangle] static RTIC_ASYNC_MAX_LOGICAL_PRIO : u8 = 1 << stm32h7xx_hal
-    :: pac :: NVIC_PRIO_BITS; use super :: * ; use core :: fmt :: Write as _;
-    use embedded_hal :: spi :: MODE_3; use heapless :: String; use
-    stm32h7xx_hal :: gpio :: { Output, Pin }; use stm32h7xx_hal :: prelude ::
-    * ; use stm32h7xx_hal :: rcc :: rec :: { Spi123ClkSel, UsbClkSel }; use
-    stm32h7xx_hal :: usb_hs :: { UsbBus, USB2 }; use stm32h7xx_hal ::
-    { pac, spi }; use usb_device :: prelude :: * ; use crate :: ahrs ::
-    Attitude; use crate :: estimator :: { Estimator, Rotation }; use crate ::
-    filters :: ImuLpf; use crate :: imu :: { Health, Imu, ImuOut };
+    :: pac :: NVIC_PRIO_BITS; use super :: * ; use embedded_hal :: spi ::
+    MODE_3; use stm32h7xx_hal :: gpio :: { Output, Pin }; use stm32h7xx_hal ::
+    prelude :: * ; use stm32h7xx_hal :: rcc :: rec ::
+    { Spi123ClkSel, UsbClkSel }; use stm32h7xx_hal :: usb_hs ::
+    { UsbBus, USB2 }; use stm32h7xx_hal :: { pac, spi }; use usb_device ::
+    prelude :: * ; use crate :: ahrs :: Attitude; use crate :: estimator ::
+    { Estimator, Rotation }; use crate :: filters :: ImuLpf; use crate :: imu
+    :: { Health, Imu, ImuOut }; use crate :: mavlink ::
+    {
+        Encoder, MAV_SYS_STATUS_SENSOR_3D_ACCEL, MAV_SYS_STATUS_SENSOR_3D_GYRO
+    };
     #[doc =
     " Tasks tick at 1 kHz (Systick monotonic), so the filter sample rate and"]
     #[doc = " fusion step are both 1 ms."] const SAMPLE_HZ : f32 = 1000.0;
@@ -23,22 +26,15 @@
     f32 = 0.05; type Imu1 = Imu < spi :: Spi < pac :: SPI1, spi :: Enabled > ,
     Pin < 'A', 4, Output > > ; type Imu2 = Imu < spi :: Spi < pac :: SPI4, spi
     :: Enabled > , Pin < 'B', 1, Output > > ; type MyUsbBus = UsbBus < USB2 >
-    ; fn health_word(h : & Health) -> & 'static str
-    {
-        match h
-        {
-            Health :: Ok(_) => "OK", Health :: Bad(_) => "FAIL", Health ::
-            Unknown => "----",
-        }
-    }
+    ;
     #[doc =
-    " Write a buffer to the CDC IN endpoint in one non-blocking call. Lines"]
+    " Write a buffer to the CDC IN endpoint in one non-blocking call. Frames"]
     #[doc =
     " longer than one USB packet (64 B) are written in a tight loop with a"]
     #[doc =
     " single poll() between packets; if the endpoint is still busy after"]
     #[doc =
-    " draining, the remainder is dropped (the next 100 ms interval retries)."]
+    " draining, the remainder is dropped (a later frame will resynchronize)."]
     fn
     pump_write(usb_dev : & mut UsbDevice < 'static, MyUsbBus > , serial : &
     mut usbd_serial :: SerialPort < 'static, MyUsbBus > , data : & [u8],)
@@ -66,7 +62,7 @@
     {
         imu1 : Imu1, lpf1 : ImuLpf, imu2 : Imu2, lpf2 : ImuLpf, est :
         Estimator, usb_dev : UsbDevice < 'static, MyUsbBus > , serial :
-        usbd_serial :: SerialPort < 'static, MyUsbBus > ,
+        usbd_serial :: SerialPort < 'static, MyUsbBus > , mavlink : Encoder,
     } #[doc = r" Execution context"] #[allow(non_snake_case)]
     #[allow(non_camel_case_types)] pub struct __rtic_internal_init_Context <
     'a >
@@ -148,7 +144,11 @@
             out1 : ImuOut { health : h1, .. Default :: default() }, out2 :
             ImuOut { health : h2, .. Default :: default() }, att : Attitude ::
             default(),
-        }, Local { imu1, lpf1, imu2, lpf2, est, usb_dev, serial, },)
+        }, Local
+        {
+            imu1, lpf1, imu2, lpf2, est, usb_dev, serial, mavlink : Encoder ::
+            new(),
+        },)
     } impl < 'a > __rtic_internal_imu1_taskLocalResources < 'a >
     {
         #[inline(always)] #[allow(missing_docs)] pub unsafe fn new() -> Self
@@ -236,6 +236,9 @@
                 serial : & mut *
                 (& mut *
                 __rtic_internal_local_resource_serial.get_mut()).as_mut_ptr(),
+                mavlink : & mut *
+                (& mut *
+                __rtic_internal_local_resource_mavlink.get_mut()).as_mut_ptr(),
                 __rtic_internal_marker : :: core :: marker :: PhantomData,
             }
         }
@@ -247,9 +250,8 @@
             {
                 out1 : shared_resources :: out1_that_needs_to_be_locked ::
                 new(), out2 : shared_resources :: out2_that_needs_to_be_locked
-                :: new(), att : shared_resources ::
-                att_that_needs_to_be_locked :: new(), __rtic_internal_marker :
-                core :: marker :: PhantomData,
+                :: new(), __rtic_internal_marker : core :: marker ::
+                PhantomData,
             }
         }
     } #[allow(non_snake_case)] #[allow(non_camel_case_types)]
@@ -490,9 +492,9 @@
     {
         #[allow(missing_docs)] pub usb_dev : & 'a mut UsbDevice < 'static,
         MyUsbBus > , #[allow(missing_docs)] pub serial : & 'a mut usbd_serial
-        :: SerialPort < 'static, MyUsbBus > , #[doc(hidden)] pub
-        __rtic_internal_marker : :: core :: marker :: PhantomData < & 'a () >
-        ,
+        :: SerialPort < 'static, MyUsbBus > , #[allow(missing_docs)] pub
+        mavlink : & 'a mut Encoder, #[doc(hidden)] pub __rtic_internal_marker
+        : :: core :: marker :: PhantomData < & 'a () > ,
     } #[allow(non_snake_case)] #[allow(non_camel_case_types)]
     #[doc = "Shared resources `usb_task` has access to"] pub struct
     __rtic_internal_usb_taskSharedResources < 'a >
@@ -500,9 +502,8 @@
         #[allow(missing_docs)] pub out1 : shared_resources ::
         out1_that_needs_to_be_locked < 'a > , #[allow(missing_docs)] pub out2
         : shared_resources :: out2_that_needs_to_be_locked < 'a > ,
-        #[allow(missing_docs)] pub att : shared_resources ::
-        att_that_needs_to_be_locked < 'a > , #[doc(hidden)] pub
-        __rtic_internal_marker : core :: marker :: PhantomData < & 'a () > ,
+        #[doc(hidden)] pub __rtic_internal_marker : core :: marker ::
+        PhantomData < & 'a () > ,
     } #[doc = r" Execution context"] #[allow(non_snake_case)]
     #[allow(non_camel_case_types)] pub struct __rtic_internal_usb_task_Context
     < 'a >
@@ -608,37 +609,65 @@
     (cx : usb_task :: Context < 'a >)
     {
         use rtic :: Mutex as _; use rtic :: mutex :: prelude :: * ; let
-        usb_dev = cx.local.usb_dev; let serial = cx.local.serial; let usb_task
-        :: SharedResources { mut out1, mut out2, mut att, .. } = cx.shared;
-        let mut tick : u32 = 0; loop
+        usb_dev = cx.local.usb_dev; let serial = cx.local.serial; let mavlink
+        = cx.local.mavlink; let usb_task :: SharedResources
+        { mut out1, mut out2, .. } = cx.shared; let mut tick : u32 = 0; loop
         {
             usb_dev.poll(& mut [serial]);
             {
                 let mut scratch = [0u8; 64]; let _ =
                 serial.read(& mut scratch);
             } if usb_dev.state() != usb_device :: device :: UsbDeviceState ::
-            Configured { Mono :: delay(1.millis()).await; continue; } if tick
-            % 100 == 0
+            Configured
             {
-                let a = att.lock(| x | * x); let mut line : String < 200 > =
-                String :: new(); let _ = write!
-                (line,
-                "ATT roll={:+7.1} pitch={:+7.1} yaw={:+7.1} deg | \
-                     rate r/p/y={:+7.1}/{:+7.1}/{:+7.1} dps | \
-                     bias={:+5.2}/{:+5.2}/{:+5.2}\r\n",
-                a.roll, a.pitch, a.yaw, a.rates[0], a.rates[1], a.rates[2],
-                a.bias[0], a.bias[1], a.bias[2],);
-                pump_write(usb_dev, serial, line.as_bytes());
-            } if tick % 1000 == 0
+                tick = tick.wrapping_add(1); Mono :: delay(1.millis()).await;
+                continue;
+            } if tick % 50 == 0
             {
-                let h1v = out1.lock(| o | o.health); let h2v =
-                out2.lock(| o | o.health); let mut line : String < 160 > =
-                String :: new(); let _ = write!
-                (line,
-                "[HB up={}s] IMU1={} WHO_AM_I=0x{:02X}({}) IMU2={} WHO_AM_I=0x{:02X}({})\r\n",
-                tick / 1000, h1v.name(), h1v.whoami(), health_word(&h1v),
-                h2v.name(), h2v.whoami(), health_word(&h2v),);
-                pump_write(usb_dev, serial, line.as_bytes());
+                let o = out1.lock(| o | * o); if matches!
+                (o.health, Health::Ok(_))
+                {
+                    let frame =
+                    mavlink.highres_imu(tick as u64 * 1_000, 0, Rotation ::
+                    Roll180.apply(o.accel), Rotation :: Roll180.apply(o.gyro),);
+                    pump_write(usb_dev, serial, frame.as_slice());
+                }
+            } if tick % 50 == 25
+            {
+                let o = out2.lock(| o | * o); if matches!
+                (o.health, Health::Ok(_))
+                {
+                    let frame =
+                    mavlink.highres_imu(tick as u64 * 1_000, 1, Rotation ::
+                    Pitch180.apply(o.accel), Rotation ::
+                    Pitch180.apply(o.gyro),);
+                    pump_write(usb_dev, serial, frame.as_slice());
+                }
+            } if tick % 1000 == 5
+            {
+                let frame = mavlink.heartbeat();
+                pump_write(usb_dev, serial, frame.as_slice());
+            } if tick % 1000 == 10
+            {
+                let h1 = out1.lock(| o | o.health); let h2 =
+                out2.lock(| o | o.health); let any_ok = matches!
+                (h1, Health::Ok(_)) || matches! (h2, Health::Ok(_)); let
+                sensors = MAV_SYS_STATUS_SENSOR_3D_ACCEL |
+                MAV_SYS_STATUS_SENSOR_3D_GYRO; let frame =
+                mavlink.sys_status(sensors, if any_ok { sensors } else { 0 });
+                pump_write(usb_dev, serial, frame.as_slice());
+            } if tick % 1000 == 15
+            {
+                let h = out1.lock(| o | o.health); let ok = matches!
+                (h, Health::Ok(_)); let frame =
+                mavlink.imu_status(tick, 0, ok, ok, h.whoami());
+                pump_write(usb_dev, serial, frame.as_slice());
+            } if tick % 1000 == 20
+            {
+                let h = out2.lock(| o | o.health); let ok = matches!
+                (h, Health::Ok(_)); let frame =
+                mavlink.imu_status(tick, 1, ok, ok, h.whoami());
+                pump_write(usb_dev, serial, frame.as_slice());
             } tick = tick.wrapping_add(1); Mono :: delay(1.millis()).await;
         }
     } #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
@@ -763,6 +792,11 @@
     __rtic_internal_local_resource_serial : rtic :: RacyCell < core :: mem ::
     MaybeUninit < usbd_serial :: SerialPort < 'static, MyUsbBus > >> = rtic ::
     RacyCell :: new(core :: mem :: MaybeUninit :: uninit());
+    #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
+    #[doc(hidden)] #[link_section = ".uninit.rtic10"] static
+    __rtic_internal_local_resource_mavlink : rtic :: RacyCell < core :: mem ::
+    MaybeUninit < Encoder >> = rtic :: RacyCell ::
+    new(core :: mem :: MaybeUninit :: uninit());
     #[allow(non_upper_case_globals)] static __rtic_internal_imu1_task_EXEC :
     rtic :: export :: executor :: AsyncTaskExecutorPtr = rtic :: export ::
     executor :: AsyncTaskExecutorPtr :: new();
@@ -935,7 +969,9 @@
             __rtic_internal_local_resource_usb_dev.get_mut().write(core :: mem
             :: MaybeUninit :: new(local_resources.usb_dev));
             __rtic_internal_local_resource_serial.get_mut().write(core :: mem
-            :: MaybeUninit :: new(local_resources.serial)); rtic :: export ::
+            :: MaybeUninit :: new(local_resources.serial));
+            __rtic_internal_local_resource_mavlink.get_mut().write(core :: mem
+            :: MaybeUninit :: new(local_resources.mavlink)); rtic :: export ::
             interrupt :: enable();
         }); loop {}
     }

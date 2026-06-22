@@ -20,7 +20,7 @@ pub enum Rotation {
 
 impl Rotation {
     #[inline]
-    fn apply(self, v: [f32; 3]) -> [f32; 3] {
+    pub fn apply(self, v: [f32; 3]) -> [f32; 3] {
         match self {
             Rotation::Roll180 => [v[0], -v[1], -v[2]],
             Rotation::Pitch180 => [-v[0], v[1], -v[2]],

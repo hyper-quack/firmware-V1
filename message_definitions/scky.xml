@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<mavlink>
+  <include>common.xml</include>
+  <dialect>200</dialect>
+  <messages>
+    <message id="42000" name="SCKY_IMU_STATUS">
+      <description>Detection and health state for one physical IMU.</description>
+      <field type="uint32_t" name="time_boot_ms" units="ms">Time since firmware boot.</field>
+      <field type="uint8_t" name="imu_id" instance="true">Zero-based physical IMU index; matches HIGHRES_IMU.id.</field>
+      <field type="uint8_t" name="connected" enum="MAV_BOOL">1 when a supported device answered WHO_AM_I during boot.</field>
+      <field type="uint8_t" name="healthy" enum="MAV_BOOL">1 when the device is usable by the estimator.</field>
+      <field type="uint8_t" name="whoami" display="hex">Raw InvenSense WHO_AM_I register value.</field>
+    </message>
+  </messages>
+</mavlink>

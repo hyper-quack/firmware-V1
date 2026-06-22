@@ -3,15 +3,18 @@
 A from-scratch, [RTIC](https://rtic.rs)-based flight-controller firmware in Rust
 for the **DAKEFPV H743** flight controller, intended to eventually replace
 ArduPilot on this hardware. This first drop brings up the board, both IMUs, and
-USB telemetry — the foundation everything else builds on.
+MAVLink 2 telemetry over USB — the foundation everything else builds on.
 
 > **Status: Milestone 1 + attitude estimation.** It probes both IMUs, samples
 > and low-pass-filters them at 1 kHz, fuses them into a stable roll/pitch/yaw
-> estimate (PX4-style complementary filter), and streams it over USB CDC. It is
+> estimate (PX4-style complementary filter), and streams per-IMU MAVLink 2
+> telemetry over USB CDC. It is
 > **not** yet a closed-loop flight controller (no control or motor output).
 >
 > The full fusion pipeline is documented in
 > **[docs/sensor-fusion.md](docs/sensor-fusion.md)**.
+> The platform receive schema is documented in
+> **[docs/mavlink-telemetry.md](docs/mavlink-telemetry.md)**.
 
 ---
 
@@ -68,7 +71,7 @@ ID it actually reads so you can confirm.
 ### USB
 
 USB-C is on **PA11/PA12 = OTG2_FS** (the HAL's `USB2` peripheral), used in
-full-speed device mode for the CDC-ACM debug console. VID/PID reused from
+full-speed device mode for the CDC-ACM MAVLink transport. VID/PID reused from
 ArduPilot: `0x1209/0x5741`.
 
 ---
@@ -102,7 +105,7 @@ host isn't draining).
 | `imu1_task` | async software | **3** | 1 kHz | read SPI1 IMU, low-pass filter, publish `out1` |
 | `imu2_task` | async software | **3** | 1 kHz | read SPI4 IMU, low-pass filter, publish `out2` |
 | `estimator_task` | async software | **2** | 1 kHz | rotate + combine both IMUs, run attitude filter, publish `att` |
-| `usb_task` | async software | 1 | 1 kHz poll | poll USB stack + stream attitude (~10 Hz) and heartbeat (1 Hz) |
+| `usb_task` | async software | 1 | 1 kHz poll | poll USB stack + stream MAVLink IMU data (20 Hz/device) and status (1 Hz) |
 
 - **Estimator sits between sampling and USB.** Sampling (prio 3) can preempt
   fusion (prio 2), and both preempt USB (prio 1) — so neither fusion nor logging
@@ -113,10 +116,10 @@ host isn't draining).
   the IN endpoint) and *writes* telemetry. This removes all cross-task locking on
   USB and — crucially — guarantees the stack is polled even when no host-driven
   interrupt happens to fire, which is what makes data actually come out. Writes go
-  through `pump_write`, which polls between 64-byte packets so full lines flush.
+  through `pump_write`, which polls between 64-byte packets so complete frames flush.
 - **Monotonic:** Systick @ 1 kHz (`rtic-monotonics`), clocked from the 64 MHz core.
 - **No dynamic allocation** anywhere in the control path; samples are passed
-  through RTIC shared resources, log lines built in stack `heapless::String`s.
+  through RTIC shared resources and MAVLink frames use fixed-capacity buffers.
 - **Dispatchers:** `LPTIM1`, `LPTIM2`, `LPTIM3` (unused peripherals borrowed for
   the three software-task priority levels).
 
@@ -272,68 +275,39 @@ Uses the **STM32 system (ROM) bootloader**, not the ArduPilot one.
 
 ---
 
-## 9. Viewing the USB CDC console
+## 9. Receiving the USB MAVLink stream
 
-After flashing, the board enumerates as a USB CDC serial port. The firmware
-**streams continuously on its own** — you do not have to type anything.
+After flashing, the board enumerates as a USB CDC serial port and streams binary
+MAVLink 2 continuously. The full receiver contract is in
+[docs/mavlink-telemetry.md](docs/mavlink-telemetry.md).
 
 ```bash
 # Confirm which node is ours right after plugging in:
 dmesg | tail -n 5            # look for "cdc_acm ... ttyACMx: USB ACM device"
 ls /dev/ttyACM*
 
-# Open it (CDC ignores the baud rate, any value works):
-picocom /dev/ttyACM0         # RECOMMENDED — quit with Ctrl-A then Ctrl-X
-# or:  tio /dev/ttyACM0      # quit with Ctrl-T then Q
-# or just dump it raw:       cat /dev/ttyACM0   (quit with Ctrl-C)
-# or:  screen /dev/ttyACM0   # quit with Ctrl-A then K, then y
+# Confirm binary frames arrive (each MAVLink 2 frame starts with fd):
+timeout 2 xxd -g1 /dev/ttyACM0
 ```
 
 If you get a permission error, add yourself to `dialout`
-(`sudo usermod -aG dialout $USER`, then re-login) or `sudo cat /dev/ttyACM0`.
+(`sudo usermod -aG dialout $USER`, then re-login).
 If the node is `ttyACM1` instead of `ttyACM0`, just use that — `dmesg` tells you
 which one.
 
-**Closing `screen`:** `screen` does *not* quit with `Ctrl-C` (that goes to the
-device) and there is no exit-on-flood — the keystrokes are: **`Ctrl-A`** then
-**`K`** then **`y`** (kill window), or **`Ctrl-A`** then **`\`** then **`y`**
-(quit). If a screen got "stuck" in the background, kill it from another terminal
-with `screen -X -S $(screen -ls | grep -o '[0-9]*\.ttys*[^ ]*' | head -1) quit`
-or simply `pkill screen`. The telemetry now refreshes at ~10 Hz (down from 20),
-which also keeps the terminal responsive; `picocom`/`tio` are easier to exit and
-recommended over `screen`.
-
-### Expected output
-
-The estimator runs at 1 kHz; the console prints the fused attitude at ~10 Hz plus
-a 1 Hz heartbeat. **Tilt the board** and `roll`/`pitch` track gravity and hold
-steady; **rotate it** and the `rate` values spike. That's your "is it reading
-correctly?" check.
-
-```
-ATT roll=   +0.4 pitch=   -1.2 yaw=   +0.0 deg | rate r/p/y=   +0.3/   -0.1/   +0.0 dps | bias=+0.00/+0.00/+0.00
-ATT roll=  +18.7 pitch=   -1.1 yaw=   +3.9 deg | rate r/p/y=  +42.5/   -0.4/   +1.1 dps | bias=-0.01/+0.00/+0.02
-[HB up=3s] IMU1=ICM-42688-P WHO_AM_I=0x47(OK) IMU2=ICM-42688-P WHO_AM_I=0x47(OK)
-```
-
-- `roll`/`pitch` come from the **fused** gravity + gyro estimate (not raw accel),
-  so they're smooth and drift-free. Flat board ⇒ ~0°/0°.
-- `yaw` is now produced (gyro-integrated). With **no magnetometer** on this board
-  it has no absolute reference and slowly drifts — expected, and explained in
-  [docs/sensor-fusion.md §7](docs/sensor-fusion.md). Roll/pitch do **not** drift.
-- `bias` is the estimator's live gyro-bias estimate (deg/s) — it should settle to
-  small values within a few seconds of sitting still.
-- A failed IMU shows in the heartbeat as `WHO_AM_I=0x00(FAIL)` (MISO stuck low) or
-  `0xFF` — see troubleshooting.
+Decode the stream with the generated `scky.xml` dialect. A healthy board yields
+one `SCKY_IMU_STATUS` for IDs 0 and 1 each second and one `HIGHRES_IMU` stream
+for each connected device. Tilting the board changes acceleration; rotating it
+changes angular velocity.
 
 ---
 
 ## 10. Milestone 1 acceptance — the bring-up gate
 
 The brief's critical first milestone is: *init SPI, toggle CS, read WHO_AM_I from
-both IMUs, output over USB; if it fails, stop and debug hardware.* That is exactly
-what the `OK / FAIL` + `WHO_AM_I=0x..` lines above tell you. Until **both** report
-`OK`, do not move on to estimation/control.
+both IMUs, output over USB; if it fails, stop and debug hardware.* Decode
+`SCKY_IMU_STATUS` and inspect `connected`, `healthy`, and `whoami`. Until both
+devices report `connected=1` and `healthy=1`, do not move on to control.
 
 | Reading | Meaning |
 |---|---|
@@ -346,12 +320,9 @@ what the `OK / FAIL` + `WHO_AM_I=0x..` lines above tell you. Until **both** repo
 
 ## 11. Troubleshooting
 
-- **Port enumerates (`/dev/ttyACMx` exists) but nothing prints.** This is what
-  the current design fixes: `usb_task` polls the USB stack every ~1 ms and
-  `pump_write` polls between packets, so multi-packet lines actually flush even
-  with no host-driven interrupt. If you still see silence, confirm you opened the
-  right node (`dmesg | tail`), try `cat /dev/ttyACMx` directly, and check it isn't
-  a permissions issue (`dialout`).
+- **Port enumerates (`/dev/ttyACMx` exists) but the parser sees nothing.** Confirm
+  raw bytes with `timeout 2 xxd -g1 /dev/ttyACMx`, select MAVLink 2, load
+  `message_definitions/scky.xml`, and check `dialout` permissions.
 - **No USB serial device appears at all.** USB runs off HSI48 (enabled
   automatically by the HAL's `freeze()`); the core runs on the internal 64 MHz
   HSI (the tested board hangs on the 480 MHz HSE/PLL startup path — see §2). If
