@@ -84,9 +84,10 @@ impl Sample {
 }
 
 /// Detection / health result for an IMU.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum Health {
     /// Not probed yet.
+    #[default]
     Unknown,
     /// WHO_AM_I matched a known v3 part. Field is the raw ID byte.
     Ok(u8),
@@ -132,6 +133,17 @@ fn is_known(id: u8) -> bool {
         i += 1;
     }
     false
+}
+
+/// Filtered, physical-unit output of one IMU channel, published by the sampling
+/// task for the estimator to consume. Gyro in deg/s, accel in g, both already
+/// low-pass filtered and in the *raw sensor frame* (board rotation applied later
+/// by the estimator).
+#[derive(Clone, Copy, Default)]
+pub struct ImuOut {
+    pub gyro: [f32; 3],
+    pub accel: [f32; 3],
+    pub health: Health,
 }
 
 /// An InvenSense v3 IMU bound to a specific SPI bus + software CS pin.

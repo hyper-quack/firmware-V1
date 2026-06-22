@@ -11,13 +11,19 @@
 //! See README.md for the full hardware map, build and flashing instructions.
 //!
 //! Task / priority layout (higher number = higher priority):
-//!   prio 3  imu1_task / imu2_task   1 kHz sampling, never blocked by USB
-//!   prio 2  otg_fs (hardware IRQ)   USB enumeration / transfers
-//!   prio 1  telemetry / heartbeat   ~50 Hz + 1 Hz status over CDC
+//!   prio 3  imu1_task / imu2_task   1 kHz sampling + per-IMU low-pass filtering
+//!   prio 2  estimator              1 kHz sensor fusion (Mahony attitude filter)
+//!   prio 1  usb_task               USB poll + ~10 Hz telemetry / 1 Hz heartbeat
+//!
+//! The sensor-fusion pipeline (filters -> dual-IMU combine -> attitude filter)
+//! is documented in `docs/sensor-fusion.md`.
 
 #![no_std]
 #![no_main]
 
+mod ahrs;
+mod estimator;
+mod filters;
 mod imu;
 
 use panic_halt as _;
@@ -30,7 +36,7 @@ systick_monotonic!(Mono, 1000);
 #[rtic::app(
     device = stm32h7xx_hal::pac,
     peripherals = true,
-    dispatchers = [LPTIM1, LPTIM2]
+    dispatchers = [LPTIM1, LPTIM2, LPTIM3]
 )]
 mod app {
     use super::*;
@@ -45,7 +51,20 @@ mod app {
     use stm32h7xx_hal::{pac, spi};
     use usb_device::prelude::*;
 
-    use crate::imu::{Health, Imu, Sample};
+    use crate::ahrs::Attitude;
+    use crate::estimator::{Estimator, Rotation};
+    use crate::filters::ImuLpf;
+    use crate::imu::{Health, Imu, ImuOut};
+
+    // ---- Fusion tuning ----------------------------------------------------
+    /// Tasks tick at 1 kHz (Systick monotonic), so the filter sample rate and
+    /// fusion step are both 1 ms.
+    const SAMPLE_HZ: f32 = 1000.0;
+    const DT: f32 = 1.0 / SAMPLE_HZ;
+    const GYRO_CUTOFF_HZ: f32 = 80.0; // gyro low-pass corner
+    const ACCEL_CUTOFF_HZ: f32 = 20.0; // accel low-pass corner (gravity is ~DC)
+    const AHRS_KP: f32 = 1.0; // accel->attitude correction gain
+    const AHRS_KI: f32 = 0.05; // gyro-bias learning gain
 
     // ---- Concrete types for the two IMU instances -------------------------
     type Imu1 = Imu<spi::Spi<pac::SPI1, spi::Enabled>, Pin<'A', 4, Output>>;
@@ -56,17 +75,20 @@ mod app {
 
     #[shared]
     struct Shared {
-        /// Latest sample + health for each IMU, published by the sampling tasks.
-        s1: Sample,
-        s2: Sample,
-        h1: Health,
-        h2: Health,
+        /// Latest filtered output of each IMU, published by the sampling tasks.
+        out1: ImuOut,
+        out2: ImuOut,
+        /// Fused attitude, published by the estimator task.
+        att: Attitude,
     }
 
     #[local]
     struct Local {
         imu1: Imu1,
+        lpf1: ImuLpf,
         imu2: Imu2,
+        lpf2: ImuLpf,
+        est: Estimator,
         // USB is owned exclusively by `usb_task`, which both polls the stack and
         // writes telemetry — so there is no cross-task locking on USB at all.
         usb_dev: UsbDevice<'static, MyUsbBus>,
@@ -175,49 +197,106 @@ mod app {
             .device_class(usbd_serial::USB_CLASS_CDC)
             .build();
 
+        // --- Build the fusion pipeline -------------------------------------
+        let lpf1 = ImuLpf::new(SAMPLE_HZ, GYRO_CUTOFF_HZ, ACCEL_CUTOFF_HZ);
+        let lpf2 = ImuLpf::new(SAMPLE_HZ, GYRO_CUTOFF_HZ, ACCEL_CUTOFF_HZ);
+        let est = Estimator::new(AHRS_KP, AHRS_KI, Rotation::Roll180, Rotation::Pitch180);
+
         // --- Kick off the periodic tasks -----------------------------------
         imu1_task::spawn().ok();
         imu2_task::spawn().ok();
+        estimator_task::spawn().ok();
         usb_task::spawn().ok();
 
         (
             Shared {
-                s1: Sample::default(),
-                s2: Sample::default(),
-                h1,
-                h2,
+                out1: ImuOut {
+                    health: h1,
+                    ..Default::default()
+                },
+                out2: ImuOut {
+                    health: h2,
+                    ..Default::default()
+                },
+                att: Attitude::default(),
             },
             Local {
                 imu1,
+                lpf1,
                 imu2,
+                lpf2,
+                est,
                 usb_dev,
                 serial,
             },
         )
     }
 
-    /// IMU1 sampling — 1 kHz, highest priority. Never blocked by USB.
-    #[task(priority = 3, local = [imu1], shared = [s1, h1])]
+    /// IMU1 sampling + low-pass filtering — 1 kHz, highest priority.
+    #[task(priority = 3, local = [imu1, lpf1], shared = [out1])]
     async fn imu1_task(mut cx: imu1_task::Context) {
         loop {
-            if let Health::Ok(_) = cx.local.imu1.health {
-                let sample = cx.local.imu1.read();
-                cx.shared.s1.lock(|s| *s = sample);
-            }
-            cx.shared.h1.lock(|h| *h = cx.local.imu1.health);
+            let health = cx.local.imu1.health;
+            let out = if let Health::Ok(_) = health {
+                let s = cx.local.imu1.read();
+                let (gyro, accel) = cx.local.lpf1.apply(s.gyro_dps(), s.accel_g());
+                ImuOut {
+                    gyro,
+                    accel,
+                    health,
+                }
+            } else {
+                ImuOut {
+                    health,
+                    ..Default::default()
+                }
+            };
+            cx.shared.out1.lock(|o| *o = out);
             Mono::delay(1.millis()).await;
         }
     }
 
-    /// IMU2 sampling — 1 kHz, highest priority.
-    #[task(priority = 3, local = [imu2], shared = [s2, h2])]
+    /// IMU2 sampling + low-pass filtering — 1 kHz, highest priority.
+    #[task(priority = 3, local = [imu2, lpf2], shared = [out2])]
     async fn imu2_task(mut cx: imu2_task::Context) {
         loop {
-            if let Health::Ok(_) = cx.local.imu2.health {
-                let sample = cx.local.imu2.read();
-                cx.shared.s2.lock(|s| *s = sample);
-            }
-            cx.shared.h2.lock(|h| *h = cx.local.imu2.health);
+            let health = cx.local.imu2.health;
+            let out = if let Health::Ok(_) = health {
+                let s = cx.local.imu2.read();
+                let (gyro, accel) = cx.local.lpf2.apply(s.gyro_dps(), s.accel_g());
+                ImuOut {
+                    gyro,
+                    accel,
+                    health,
+                }
+            } else {
+                ImuOut {
+                    health,
+                    ..Default::default()
+                }
+            };
+            cx.shared.out2.lock(|o| *o = out);
+            Mono::delay(1.millis()).await;
+        }
+    }
+
+    /// Sensor fusion — 1 kHz. Combines both filtered IMUs and runs the Mahony
+    /// attitude filter. Priority 2: above USB, below raw sampling.
+    #[task(priority = 2, local = [est], shared = [out1, out2, att])]
+    async fn estimator_task(cx: estimator_task::Context) {
+        let est = cx.local.est;
+        let estimator_task::SharedResources {
+            mut out1,
+            mut out2,
+            mut att,
+            ..
+        } = cx.shared;
+
+        loop {
+            let o1 = out1.lock(|o| *o);
+            let o2 = out2.lock(|o| *o);
+            let a = est.update(&o1, &o2, DT);
+            att.lock(|x| *x = a);
             Mono::delay(1.millis()).await;
         }
     }
@@ -225,15 +304,14 @@ mod app {
     /// Owns the whole USB stack: polls it at ~1 kHz (keeps enumeration alive and
     /// flushes the IN endpoint) and streams human-readable telemetry. Lowest
     /// priority, so it can never delay the IMU sampling tasks.
-    #[task(priority = 1, local = [usb_dev, serial], shared = [s1, s2, h1, h2])]
+    #[task(priority = 1, local = [usb_dev, serial], shared = [out1, out2, att])]
     async fn usb_task(cx: usb_task::Context) {
         let usb_dev = cx.local.usb_dev;
         let serial = cx.local.serial;
         let usb_task::SharedResources {
-            mut s1,
-            mut s2,
-            mut h1,
-            mut h2,
+            mut out1,
+            mut out2,
+            mut att,
             ..
         } = cx.shared;
 
@@ -241,34 +319,50 @@ mod app {
         loop {
             // Service the USB stack every tick (~1 ms). Discard any host->device
             // bytes so the OUT endpoint never stalls.
-            if usb_dev.poll(&mut [serial]) {
+            usb_dev.poll(&mut [serial]);
+            {
                 let mut scratch = [0u8; 64];
                 let _ = serial.read(&mut scratch);
             }
 
-            // Live IMU data ~20 Hz.
-            if tick % 50 == 0 {
-                let (a1, h1v) = (s1.lock(|s| *s), h1.lock(|h| *h));
-                let (a2, h2v) = (s2.lock(|s| *s), h2.lock(|h| *h));
+            // Only write when fully configured — skip (and don't count the tick)
+            // until the host has completed enumeration.
+            if usb_dev.state() != usb_device::device::UsbDeviceState::Configured {
+                Mono::delay(1.millis()).await;
+                continue;
+            }
 
-                let mut line: String<320> = String::new();
-                let _ = write!(line, "{}", FmtImu("IMU1", &h1v, &a1));
-                let _ = write!(line, "{}", FmtImu("IMU2", &h2v, &a2));
+            // Fused attitude ~10 Hz (slow enough to read comfortably in a
+            // terminal; the estimator itself still runs at 1 kHz).
+            if tick % 100 == 0 {
+                let a = att.lock(|x| *x);
+                let mut line: String<200> = String::new();
+                let _ = write!(
+                    line,
+                    "ATT roll={:+7.1} pitch={:+7.1} yaw={:+7.1} deg | \
+                     rate r/p/y={:+7.1}/{:+7.1}/{:+7.1} dps | \
+                     bias={:+5.2}/{:+5.2}/{:+5.2}\r\n",
+                    a.roll, a.pitch, a.yaw,
+                    a.rates[0], a.rates[1], a.rates[2],
+                    a.bias[0], a.bias[1], a.bias[2],
+                );
                 pump_write(usb_dev, serial, line.as_bytes());
             }
 
             // Status banner / heartbeat ~1 Hz.
             if tick % 1000 == 0 {
-                let h1v = h1.lock(|h| *h);
-                let h2v = h2.lock(|h| *h);
+                let h1v = out1.lock(|o| o.health);
+                let h2v = out2.lock(|o| o.health);
                 let mut line: String<160> = String::new();
                 let _ = write!(
                     line,
-                    "[HB up={}s] IMU1={}({}) IMU2={}({})\r\n",
+                    "[HB up={}s] IMU1={} WHO_AM_I=0x{:02X}({}) IMU2={} WHO_AM_I=0x{:02X}({})\r\n",
                     tick / 1000,
                     h1v.name(),
+                    h1v.whoami(),
                     health_word(&h1v),
                     h2v.name(),
+                    h2v.whoami(),
                     health_word(&h2v),
                 );
                 pump_write(usb_dev, serial, line.as_bytes());
@@ -287,56 +381,25 @@ mod app {
         }
     }
 
-    /// One formatted telemetry line for an IMU: detection status + derived
-    /// roll/pitch (from gravity), gyro rates, and raw accel — easy to eyeball
-    /// while tilting the board to confirm it reads correctly.
-    struct FmtImu<'a>(&'a str, &'a Health, &'a Sample);
-    impl core::fmt::Display for FmtImu<'_> {
-        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-            let (tag, h, s) = (self.0, self.1, self.2);
-            let g = s.gyro_dps();
-            let a = s.accel_g();
-            write!(
-                f,
-                "{} {} WHO_AM_I=0x{:02X} | roll={:+6.1} pitch={:+6.1} deg | \
-                 gyro r/p/y={:+7.1}/{:+7.1}/{:+7.1} dps | acc={:+5.2}/{:+5.2}/{:+5.2} g\r\n",
-                tag,
-                health_word(h),
-                h.whoami(),
-                s.roll_deg(),
-                s.pitch_deg(),
-                g[0],
-                g[1],
-                g[2],
-                a[0],
-                a[1],
-                a[2],
-            )
-        }
-    }
-
-    /// Write a whole buffer to the CDC IN endpoint, polling the stack between
-    /// packets so multi-packet lines (>64 B) actually get flushed. Bounded spin
-    /// so it gives up (drops the rest) if the host isn't reading the port.
+    /// Write a buffer to the CDC IN endpoint in one non-blocking call. Lines
+    /// longer than one USB packet (64 B) are written in a tight loop with a
+    /// single poll() between packets; if the endpoint is still busy after
+    /// draining, the remainder is dropped (the next 100 ms interval retries).
     fn pump_write(
         usb_dev: &mut UsbDevice<'static, MyUsbBus>,
         serial: &mut usbd_serial::SerialPort<'static, MyUsbBus>,
         data: &[u8],
     ) {
         let mut off = 0;
-        let mut spins = 0u32;
         while off < data.len() {
             match serial.write(&data[off..]) {
-                Ok(n) if n > 0 => {
-                    off += n;
-                    spins = 0;
-                }
+                Ok(n) if n > 0 => off += n,
                 _ => {
-                    // Endpoint full (or not yet open): let the stack flush it.
-                    let _ = usb_dev.poll(&mut [serial]);
-                    spins += 1;
-                    if spins > 2000 {
-                        break; // host not draining — drop the remainder
+                    // Flush the endpoint and give it one more chance.
+                    usb_dev.poll(&mut [serial]);
+                    match serial.write(&data[off..]) {
+                        Ok(n) if n > 0 => off += n,
+                        _ => break, // host not draining — drop remainder
                     }
                 }
             }
