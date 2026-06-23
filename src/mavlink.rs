@@ -17,6 +17,20 @@ const MSG_HEARTBEAT: u32 = 0;
 const CRC_HEARTBEAT: u8 = 50;
 const MSG_SYS_STATUS: u32 = 1;
 const CRC_SYS_STATUS: u8 = 124;
+const MSG_GPS_RAW_INT: u32 = 24;
+const CRC_GPS_RAW_INT: u8 = 24;
+const MSG_SCALED_PRESSURE: u32 = 29;
+const CRC_SCALED_PRESSURE: u8 = 115;
+const MSG_ATTITUDE: u32 = 30;
+const CRC_ATTITUDE: u8 = 39;
+const MSG_GLOBAL_POSITION_INT: u32 = 33;
+const CRC_GLOBAL_POSITION_INT: u8 = 104;
+const MSG_RC_CHANNELS: u32 = 65;
+const CRC_RC_CHANNELS: u8 = 118;
+const MSG_OPTICAL_FLOW: u32 = 100;
+const CRC_OPTICAL_FLOW: u8 = 175;
+const MSG_DISTANCE_SENSOR: u32 = 132;
+const CRC_DISTANCE_SENSOR: u8 = 85;
 const MSG_HIGHRES_IMU: u32 = 105;
 const CRC_HIGHRES_IMU: u8 = 93;
 const MSG_SCKY_IMU_STATUS: u32 = 42_000;
@@ -65,13 +79,16 @@ impl Encoder {
     }
 
     /// Standard HIGHRES_IMU (message 105). Acceleration is m/s^2, angular
-    /// velocity is rad/s, and `id` identifies physical IMU 0 or 1.
+    /// velocity is rad/s, magnetometer (when present) is Gauss, and `id`
+    /// identifies physical IMU 0 or 1. Pass `mag_ga = None` when this stream has
+    /// no magnetometer attached.
     pub fn highres_imu(
         &mut self,
         time_usec: u64,
         id: u8,
         accel_g: [f32; 3],
         gyro_dps: [f32; 3],
+        mag_ga: Option<[f32; 3]>,
     ) -> Frame {
         const G_TO_M_S2: f32 = 9.806_65;
         const DEG_TO_RAD: f32 = 0.017_453_293;
@@ -84,14 +101,126 @@ impl Encoder {
         for value in gyro_dps {
             p.f32(value * DEG_TO_RAD);
         }
-        // Magnetometer, pressure, altitude, and temperature are not measured
-        // in this slice. NaN plus fields_updated=0 for those fields is explicit.
-        for _ in 0..7 {
-            p.f32(f32::NAN);
+        // Magnetometer (Gauss). Pressure/altitude/temperature are not measured
+        // in this slice — NaN with their fields_updated bits clear is explicit.
+        match mag_ga {
+            Some(m) => {
+                for value in m {
+                    p.f32(value);
+                }
+            }
+            None => {
+                for _ in 0..3 {
+                    p.f32(f32::NAN);
+                }
+            }
         }
-        p.u16(0x003F); // x/y/z accel + x/y/z gyro updated
+        for _ in 0..4 {
+            p.f32(f32::NAN); // abs_pressure, diff_pressure, pressure_alt, temperature
+        }
+        // bits 0..5 = x/y/z accel + x/y/z gyro; bits 6..8 = x/y/z mag.
+        let updated = if mag_ga.is_some() { 0x01FF } else { 0x003F };
+        p.u16(updated);
         p.u8(id); // MAVLink 2 extension field
         self.frame(MSG_HIGHRES_IMU, CRC_HIGHRES_IMU, p.as_slice())
+    }
+
+    /// SCALED_PRESSURE (message 29): barometer. `press_abs`/`press_diff` in hPa,
+    /// `temperature` in centidegrees Celsius.
+    pub fn scaled_pressure(
+        &mut self,
+        time_boot_ms: u32,
+        press_abs_hpa: f32,
+        press_diff_hpa: f32,
+        temperature_cdeg: i16,
+    ) -> Frame {
+        let mut p = Payload::new();
+        p.u32(time_boot_ms);
+        p.f32(press_abs_hpa);
+        p.f32(press_diff_hpa);
+        p.i16(temperature_cdeg);
+        self.frame(MSG_SCALED_PRESSURE, CRC_SCALED_PRESSURE, p.as_slice())
+    }
+
+    /// Standard ATTITUDE (message 30). Angles in radians, rates in rad/s.
+    pub fn attitude(
+        &mut self,
+        time_boot_ms: u32,
+        roll_rad: f32,
+        pitch_rad: f32,
+        yaw_rad: f32,
+        rollspeed: f32,
+        pitchspeed: f32,
+        yawspeed: f32,
+    ) -> Frame {
+        let mut p = Payload::new();
+        p.u32(time_boot_ms);
+        p.f32(roll_rad);
+        p.f32(pitch_rad);
+        p.f32(yaw_rad);
+        p.f32(rollspeed);
+        p.f32(pitchspeed);
+        p.f32(yawspeed);
+        self.frame(MSG_ATTITUDE, CRC_ATTITUDE, p.as_slice())
+    }
+
+    /// Standard GLOBAL_POSITION_INT (message 33): fused/global position. lat/lon
+    /// in 1e7-deg, altitudes in mm, velocities in cm/s, heading in centidegrees
+    /// (65535 = unknown).
+    #[allow(clippy::too_many_arguments)]
+    pub fn global_position_int(
+        &mut self,
+        time_boot_ms: u32,
+        lat_e7: i32,
+        lon_e7: i32,
+        alt_mm: i32,
+        relative_alt_mm: i32,
+        vx_cms: i16,
+        vy_cms: i16,
+        vz_cms: i16,
+        hdg_cdeg: u16,
+    ) -> Frame {
+        let mut p = Payload::new();
+        p.u32(time_boot_ms);
+        p.i32(lat_e7);
+        p.i32(lon_e7);
+        p.i32(alt_mm);
+        p.i32(relative_alt_mm);
+        p.i16(vx_cms);
+        p.i16(vy_cms);
+        p.i16(vz_cms);
+        p.u16(hdg_cdeg);
+        self.frame(MSG_GLOBAL_POSITION_INT, CRC_GLOBAL_POSITION_INT, p.as_slice())
+    }
+
+    /// Standard GPS_RAW_INT (message 24). Units match the wire format directly:
+    /// lat/lon in degrees * 1e7, alt in mm (MSL), eph = HDOP * 100, vel in cm/s,
+    /// cog in centidegrees.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gps_raw_int(
+        &mut self,
+        time_usec: u64,
+        fix_type: u8,
+        lat_e7: i32,
+        lon_e7: i32,
+        alt_mm: i32,
+        eph: u16,
+        vel_cms: u16,
+        cog_cdeg: u16,
+        sats: u8,
+    ) -> Frame {
+        let mut p = Payload::new();
+        p.u64(time_usec);
+        p.i32(lat_e7);
+        p.i32(lon_e7);
+        p.i32(alt_mm);
+        p.u16(eph);
+        p.u16(u16::MAX); // epv (VDOP) unknown
+        p.u16(vel_cms);
+        p.u16(cog_cdeg);
+        p.u8(fix_type);
+        p.u8(sats);
+        self.frame(MSG_GPS_RAW_INT, CRC_GPS_RAW_INT, p.as_slice())
     }
 
     /// Per-device status from `message_definitions/scky.xml`.
@@ -110,6 +239,71 @@ impl Encoder {
         p.u8(healthy as u8);
         p.u8(whoami);
         self.frame(MSG_SCKY_IMU_STATUS, CRC_SCKY_IMU_STATUS, p.as_slice())
+    }
+
+    /// DISTANCE_SENSOR (message 132): downward lidar height. Distances in cm.
+    /// `orientation` 25 = MAV_SENSOR_ROTATION_PITCH_270 (facing straight down).
+    pub fn distance_sensor(
+        &mut self,
+        time_boot_ms: u32,
+        min_cm: u16,
+        max_cm: u16,
+        current_cm: u16,
+    ) -> Frame {
+        let mut p = Payload::new();
+        p.u32(time_boot_ms);
+        p.u16(min_cm);
+        p.u16(max_cm);
+        p.u16(current_cm);
+        p.u8(0); // type: 0 = laser rangefinder
+        p.u8(0); // id
+        p.u8(25); // orientation: facing down
+        p.u8(0); // covariance unknown
+        self.frame(MSG_DISTANCE_SENSOR, CRC_DISTANCE_SENSOR, p.as_slice())
+    }
+
+    /// OPTICAL_FLOW (message 100). `flow_comp_m` are de-rotated ground velocities
+    /// (m/s), `ground_distance` is height (m), `quality` 0..255.
+    #[allow(clippy::too_many_arguments)]
+    pub fn optical_flow(
+        &mut self,
+        time_usec: u64,
+        flow_x: i16,
+        flow_y: i16,
+        flow_comp_m_x: f32,
+        flow_comp_m_y: f32,
+        ground_distance: f32,
+        quality: u8,
+    ) -> Frame {
+        let mut p = Payload::new();
+        p.u64(time_usec);
+        p.f32(flow_comp_m_x);
+        p.f32(flow_comp_m_y);
+        p.f32(ground_distance);
+        p.i16(flow_x);
+        p.i16(flow_y);
+        p.u8(0); // sensor_id
+        p.u8(quality);
+        self.frame(MSG_OPTICAL_FLOW, CRC_OPTICAL_FLOW, p.as_slice())
+    }
+
+    /// RC_CHANNELS (message 65): up to 18 channels in µs. `rssi` 0..254
+    /// (255 = unknown). Unused channels should be 65535 (UINT16_MAX).
+    pub fn rc_channels(
+        &mut self,
+        time_boot_ms: u32,
+        chancount: u8,
+        ch: &[u16; 18],
+        rssi: u8,
+    ) -> Frame {
+        let mut p = Payload::new();
+        p.u32(time_boot_ms);
+        for &c in ch.iter() {
+            p.u16(c);
+        }
+        p.u8(chancount);
+        p.u8(rssi);
+        self.frame(MSG_RC_CHANNELS, CRC_RC_CHANNELS, p.as_slice())
     }
 
     fn frame(&mut self, message_id: u32, crc_extra: u8, payload: &[u8]) -> Frame {
@@ -177,6 +371,10 @@ impl Payload {
     }
 
     fn u32(&mut self, value: u32) {
+        let _ = self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn i32(&mut self, value: i32) {
         let _ = self.bytes.extend_from_slice(&value.to_le_bytes());
     }
 

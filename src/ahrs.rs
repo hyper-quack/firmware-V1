@@ -69,8 +69,20 @@ impl Mahony {
     }
 
     /// One update step. `gyro_dps` in deg/s, `accel_g` in g (any consistent unit;
-    /// it is normalized), `dt` in seconds.
-    pub fn update(&mut self, gyro_dps: [f32; 3], accel_g: [f32; 3], dt: f32) {
+    /// it is normalized), `mag` (any consistent unit; normalized) optional, `dt`
+    /// in seconds.
+    ///
+    /// With `mag = Some(..)` this is the full 9-DOF Mahony AHRS: the
+    /// magnetometer corrects heading about the gravity axis, so yaw becomes
+    /// **absolute** (no drift). With `mag = None` it degrades to the 6-DOF
+    /// accel-only filter, where yaw is gyro-integrated and drifts.
+    pub fn update(
+        &mut self,
+        gyro_dps: [f32; 3],
+        accel_g: [f32; 3],
+        mag: Option<[f32; 3]>,
+        dt: f32,
+    ) {
         let mut gx = gyro_dps[0] * DEG2RAD;
         let mut gy = gyro_dps[1] * DEG2RAD;
         let mut gz = gyro_dps[2] * DEG2RAD;
@@ -98,10 +110,48 @@ impl Mahony {
             let vy = 2.0 * (q0 * q1 + q2 * q3);
             let vz = q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3;
 
-            // Error = measured gravity x estimated gravity.
-            let ex = ay * vz - az * vy;
-            let ey = az * vx - ax * vz;
-            let ez = ax * vy - ay * vx;
+            // Error = measured gravity x estimated gravity (roll/pitch).
+            let mut ex = ay * vz - az * vy;
+            let mut ey = az * vx - ax * vz;
+            let mut ez = ax * vy - ay * vx;
+
+            // Magnetometer correction (heading). Adds the cross-product error
+            // between the measured field and the field direction predicted from
+            // the current quaternion — the standard Mahony 9-DOF term.
+            if let Some(m) = mag {
+                let mnorm = libm::sqrtf(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
+                if mnorm > 1.0e-6 {
+                    let mx = m[0] / mnorm;
+                    let my = m[1] / mnorm;
+                    let mz = m[2] / mnorm;
+
+                    // Earth-frame field from the current attitude, then folded
+                    // back to a horizontal reference (bx) + vertical (bz) so the
+                    // correction only constrains heading, not tilt.
+                    let hx = 2.0
+                        * (mx * (0.5 - q2 * q2 - q3 * q3)
+                            + my * (q1 * q2 - q0 * q3)
+                            + mz * (q1 * q3 + q0 * q2));
+                    let hy = 2.0
+                        * (mx * (q1 * q2 + q0 * q3)
+                            + my * (0.5 - q1 * q1 - q3 * q3)
+                            + mz * (q2 * q3 - q0 * q1));
+                    let bx = libm::sqrtf(hx * hx + hy * hy);
+                    let bz = 2.0
+                        * (mx * (q1 * q3 - q0 * q2)
+                            + my * (q2 * q3 + q0 * q1)
+                            + mz * (0.5 - q1 * q1 - q2 * q2));
+
+                    // Predicted field direction in the body frame.
+                    let wx = 2.0 * (bx * (0.5 - q2 * q2 - q3 * q3) + bz * (q1 * q3 - q0 * q2));
+                    let wy = 2.0 * (bx * (q1 * q2 - q0 * q3) + bz * (q0 * q1 + q2 * q3));
+                    let wz = 2.0 * (bx * (q0 * q2 + q1 * q3) + bz * (0.5 - q1 * q1 - q2 * q2));
+
+                    ex += my * wz - mz * wy;
+                    ey += mz * wx - mx * wz;
+                    ez += mx * wy - my * wx;
+                }
+            }
 
             // Integral feedback => gyro bias estimate.
             if self.two_ki > 0.0 {

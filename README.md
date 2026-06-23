@@ -60,13 +60,38 @@ ID it actually reads so you can confirm.
 > Systick-driven RTIC task (see §4). The mounting rotations above are documented
 > for when the attitude estimator is added — raw output is currently unrotated.
 
+### GPS + external compass — uBlox NEO-M8N module
+
+| Device | ArduPilot line | Bus / pins | Driver |
+|---|---|---|---|
+| GPS | `SERIAL1 = GPS` (USART1) | USART1 (PA9 TX / PA10 RX), 9600 baud | [gps.rs](src/gps.rs) |
+| Compass | external I2C probe (QMC/HMC5883) | I2C2 (PB10 SCL / PB11 SDA), 0x0D / 0x1E | [compass.rs](src/compass.rs) |
+
+GPS NMEA is parsed and streamed as `GPS_RAW_INT`; the magnetometer is auto-detected
+(QMC5883L clone or genuine HMC5883L) and streamed in `HIGHRES_IMU`. Bring-up,
+wiring detail, and the full board placement map are in
+[docs/gps-compass.md](docs/gps-compass.md).
+
+### Other devices on the board (present, not yet driven)
+
+| Function | ArduPilot line | Bus / pins | Driver |
+|---|---|---|---|
+| Optical flow + lidar (MTF-01) | external (MSP) | USART2 (PD5 TX / PD6 RX), 115200 | [mtf01.rs](src/mtf01.rs) |
+| ExpressLRS 900 RX (CRSF) | `SERIAL5 = RCIN` (UART5) | UART5 (PB5 RX / PB6 TX), 420000 | [crsf.rs](src/crsf.rs) |
+| Barometer (SPL06) | `BARO SPL06 I2C:0:0x76` | I2C2 (PB10 SCL / PB11 SDA), 0x76 | [baro.rs](src/baro.rs) |
+
+MTF-01 flow/lidar drives `OPTICAL_FLOW` + `DISTANCE_SENSOR` (height-above-ground)
+and a flow dead-reckoning estimate ([nav.rs](src/nav.rs)); the ELRS receiver drives
+`RC_CHANNELS`; the SPL06 baro drives `SCALED_PRESSURE`. The compass and baro share
+I2C2, polled by one task. Detail in [docs/mtf01-elrs.md](docs/mtf01-elrs.md) and
+[docs/baro-spl06.md](docs/baro-spl06.md).
+
 ### Other devices on the board (present, not yet driven)
 
 | Function | ArduPilot line | Bus / pins |
 |---|---|---|
 | OSD | `SPIDEV osd SPI2 … OSD1_CS MODE0` | SPI2 (PB13/14/15), CS PB12 |
 | Dataflash | `SPIDEV dataflash SPI3 … FLASH1_CS MODE3` | SPI3 (PC10/11/12), CS PA15 |
-| Barometer | `BARO SPL06 I2C:0:0x76` | I2C2 (PB10 SCL / PB11 SDA), addr 0x76 |
 
 ### USB
 

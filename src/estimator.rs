@@ -44,8 +44,16 @@ impl Estimator {
     }
 
     /// Run one fusion step over the latest filtered IMU outputs and return the
-    /// updated attitude. `dt` is the step period in seconds.
-    pub fn update(&mut self, imu1: &ImuOut, imu2: &ImuOut, dt: f32) -> Attitude {
+    /// updated attitude. `mag` is the body-frame magnetometer field (Gauss) when
+    /// a healthy compass is present — it makes yaw absolute. `dt` is the step
+    /// period in seconds.
+    pub fn update(
+        &mut self,
+        imu1: &ImuOut,
+        imu2: &ImuOut,
+        mag: Option<[f32; 3]>,
+        dt: f32,
+    ) -> Attitude {
         let ok1 = matches!(imu1.health, Health::Ok(_));
         let ok2 = matches!(imu2.health, Health::Ok(_));
 
@@ -63,7 +71,7 @@ impl Estimator {
             (false, false) => ([0.0; 3], [0.0, 0.0, 1.0]), // hold level-ish
         };
 
-        self.ahrs.update(gyro, accel, dt);
+        self.ahrs.update(gyro, accel, mag, dt);
         self.ahrs.attitude(gyro)
     }
 }

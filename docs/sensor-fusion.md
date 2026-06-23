@@ -174,26 +174,35 @@ yaw   = atan2(2(q0q3 + q1q2), 1 − 2(q2² + q3²))
 
 ---
 
-## 7. Why yaw drifts (and roll/pitch don't)
+## 7. Heading: mag-aided yaw (Phase 2)
 
 Gravity gives an **absolute** reference for roll and pitch — tilt is directly
 observable from the accelerometer — so those two are corrected every step and do
-**not** drift.
+**not** drift. Yaw (heading) is rotation *about* the gravity vector, so gravity
+says nothing about it.
 
-Yaw (heading) is rotation *about* the gravity vector, so gravity says nothing
-about it. With no magnetometer fused, yaw is pure **gyro integration**: smooth
-and locally correct, but with no absolute reference it slowly drifts (gyro bias ×
-time). That's expected and is why this board needs a magnetometer (or GPS course)
-for an absolute heading.
+With the external compass now wired ([gps-compass.md](gps-compass.md)), the
+`Mahony::update` step takes an optional magnetometer vector and adds the standard
+**9-DOF heading-correction term**: the cross-product between the measured field
+and the field direction predicted from the current quaternion, folded so it
+constrains only heading (not tilt). The earth-frame field is split into a
+horizontal reference `bx` and vertical `bz`, so a tilted compass still yields the
+correct heading. The result feeds the same PI loop as the accel term.
 
-> This board's hwdef declares **no onboard compass** (only an SPL06 baro on I2C2),
-> so a mag would be an external I2C module. Once present, adding a mag correction
-> term to `Mahony` (or moving to EKF2) makes yaw absolute.
+Effect: when a healthy compass is present, **yaw is absolute and does not drift**.
+When the compass is absent or unhealthy, `update` is called with `mag = None` and
+the filter degrades gracefully to the 6-DOF accel-only form (yaw = gyro
+integration, drifts) — no code path change, just a missing correction.
 
-The earlier "yaw not calculated" was deliberate: from a single accel reading yaw
-is unobservable, so printing an accel-derived yaw would have been meaningless.
-Now that we integrate the gyro in the filter, yaw **is** produced — just flagged
-as relative/drifting.
+> **Not yet tuned on hardware:** the mag is fused in its raw sensor frame assuming
+> the compass is mounted aligned with the board. Real units need (a) a mount
+> rotation/sign map (ArduPilot's `COMPASS_ORIENT`), (b) hard/soft-iron
+> calibration, and (c) magnetic declination to convert magnetic → true north.
+> These are bench-calibration steps for when the module is powered and spinning.
+
+The fused attitude is emitted as MAVLink `ATTITUDE` (#30) and the heading also
+rides in `GLOBAL_POSITION_INT` (#33), so ground stations show a real fused
+heading rather than integrating one themselves.
 
 ---
 
