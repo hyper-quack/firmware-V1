@@ -35,6 +35,8 @@ const MSG_DISTANCE_SENSOR: u32 = 132;
 const CRC_DISTANCE_SENSOR: u8 = 85;
 const MSG_HIGHRES_IMU: u32 = 105;
 const CRC_HIGHRES_IMU: u8 = 93;
+const MSG_STATUSTEXT: u32 = 253;
+const CRC_STATUSTEXT: u8 = 83;
 const MSG_SCKY_IMU_STATUS: u32 = 42_000;
 const CRC_SCKY_IMU_STATUS: u8 = 38;
 
@@ -247,6 +249,19 @@ impl Encoder {
         p.u8(fix_type);
         p.u8(sats);
         self.frame(MSG_GPS_RAW_INT, CRC_GPS_RAW_INT, p.as_slice())
+    }
+
+    /// STATUSTEXT (message 253): human-readable diagnostic string.  `severity` is
+    /// a `MAV_SEVERITY` value (6 = DEBUG).  `text` is truncated / zero-padded to
+    /// exactly 50 bytes as required by the wire format.
+    pub fn statustext(&mut self, severity: u8, text: &str) -> Frame {
+        let mut p = Payload::new();
+        p.u8(severity);
+        let bytes = text.as_bytes();
+        for i in 0..50_usize {
+            p.u8(if i < bytes.len() { bytes[i] } else { 0 });
+        }
+        self.frame(MSG_STATUSTEXT, CRC_STATUSTEXT, p.as_slice())
     }
 
     /// Per-device status from `message_definitions/scky.xml`.

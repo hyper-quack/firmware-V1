@@ -7,12 +7,13 @@
     #[doc =
     r" Holds the maximum priority level for use by async HAL drivers."]
     #[no_mangle] static RTIC_ASYNC_MAX_LOGICAL_PRIO : u8 = 3u8; use super :: *
-    ; use embedded_hal :: spi :: MODE_3; use stm32h7xx_hal :: gpio ::
-    { Output, Pin }; use stm32h7xx_hal :: prelude :: * ; use stm32h7xx_hal ::
-    rcc :: rec :: { Spi123ClkSel, UsbClkSel }; use stm32h7xx_hal :: serial ::
-    Rx; use stm32h7xx_hal :: usb_hs :: { UsbBus, USB2 }; use stm32h7xx_hal ::
-    { i2c, pac, spi }; use usb_device :: prelude :: * ; use crate :: ahrs ::
-    Attitude; use crate :: baro :: { Baro, BaroData }; use crate :: compass ::
+    ; use core :: fmt :: Write as FmtWrite; use embedded_hal :: spi :: MODE_3;
+    use stm32h7xx_hal :: gpio :: { Output, Pin }; use stm32h7xx_hal :: prelude
+    :: * ; use stm32h7xx_hal :: rcc :: rec :: { Spi123ClkSel, UsbClkSel }; use
+    stm32h7xx_hal :: serial :: { self, Rx }; use stm32h7xx_hal :: usb_hs ::
+    { UsbBus, USB2 }; use stm32h7xx_hal :: { i2c, pac, spi }; use usb_device
+    :: prelude :: * ; use crate :: ahrs :: Attitude; use crate :: baro ::
+    { Baro, BaroData }; use crate :: compass ::
     { Compass, MagCal, MagData, MagRotation }; use crate :: crsf ::
     { CrsfParser, RcChannels }; use crate :: ekf :: { Ekf, NavSolution }; use
     crate :: estimator :: { Estimator, Rotation }; use crate :: filters ::
@@ -181,8 +182,8 @@
         us : u32 | cortex_m :: asm :: delay(us.saturating_mul(64)); let h1 =
         imu1.init(& delay_us); let h2 = imu2.init(& delay_us); let serial1 =
         dp.USART1.serial((gpioa.pa9.into_alternate :: < 7 > (),
-        gpioa.pa10.into_alternate :: < 7 > (),), GPS_BAUD.bps(),
-        ccdr.peripheral.USART1, & ccdr.clocks,).unwrap(); let
+        gpioa.pa10.into_alternate :: < 7 > ().internal_pull_up(true),),
+        GPS_BAUD.bps(), ccdr.peripheral.USART1, & ccdr.clocks,).unwrap(); let
         (_gps_tx, mut gps_rx) = serial1.split(); gps_rx.listen(); let mut i2c2
         =
         dp.I2C2.i2c((gpiob.pb10.into_alternate_open_drain(),
@@ -191,24 +192,25 @@
         new(); compass.init(& mut i2c2); let mut baro = Baro :: new();
         baro.init(& mut i2c2, & delay_us); let serial2 =
         dp.USART2.serial((gpiod.pd5.into_alternate :: < 7 > (),
-        gpiod.pd6.into_alternate :: < 7 > (),), MTF01_BAUD.bps(),
-        ccdr.peripheral.USART2, & ccdr.clocks,).unwrap(); let
-        (_mtf_tx, mut mtf_rx) = serial2.split(); mtf_rx.listen(); let serial5
-        =
+        gpiod.pd6.into_alternate :: < 7 > ().internal_pull_up(true),),
+        MTF01_BAUD.bps(), ccdr.peripheral.USART2, & ccdr.clocks,).unwrap();
+        let (_mtf_tx, mut mtf_rx) = serial2.split(); mtf_rx.listen(); let
+        serial5 =
         dp.UART5.serial((gpiob.pb6.into_alternate :: < 14 > (),
-        gpiob.pb5.into_alternate :: < 14 > (),), CRSF_BAUD.bps(),
-        ccdr.peripheral.UART5, & ccdr.clocks,).unwrap(); let
+        gpiob.pb5.into_alternate :: < 14 > ().internal_pull_up(true),),
+        CRSF_BAUD.bps(), ccdr.peripheral.UART5, & ccdr.clocks,).unwrap(); let
         (_crsf_tx, mut crsf_rx) = serial5.split(); crsf_rx.listen(); let
         serial6 =
-        dp.USART6.serial((gpioc.pc6.into_alternate :: < 7 > (),
-        gpioc.pc7.into_alternate :: < 7 > (),), TFLUNA_BAUD.bps(),
+        dp.USART6.serial((gpioc.pc6.into_alternate :: < 7 >
+        ().internal_pull_up(true), gpioc.pc7.into_alternate :: < 7 > (),),
+        serial :: config :: Config :: new(TFLUNA_BAUD.bps()).swaptxrx(true),
         ccdr.peripheral.USART6, & ccdr.clocks,).unwrap(); let
         (_tfl_l_tx, mut tfl_left_rx) = serial6.split(); tfl_left_rx.listen();
         let serial7 =
         dp.UART7.serial((gpioe.pe8.into_alternate :: < 7 > (),
-        gpioe.pe7.into_alternate :: < 7 > (),), TFLUNA_BAUD.bps(),
-        ccdr.peripheral.UART7, & ccdr.clocks,).unwrap(); let
-        (_tfl_r_tx, mut tfl_right_rx) = serial7.split();
+        gpioe.pe7.into_alternate :: < 7 > ().internal_pull_up(true),),
+        TFLUNA_BAUD.bps(), ccdr.peripheral.UART7, & ccdr.clocks,).unwrap();
+        let (_tfl_r_tx, mut tfl_right_rx) = serial7.split();
         tfl_right_rx.listen(); let usb = USB2 ::
         new(dp.OTG2_HS_GLOBAL, dp.OTG2_HS_DEVICE, dp.OTG2_HS_PWRCLK,
         gpioa.pa11.into_alternate :: < 10 > (), gpioa.pa12.into_alternate :: <
@@ -1702,6 +1704,14 @@
                 let h = out2.lock(| o | o.health); let ok = matches!
                 (h, Health::Ok(_)); let frame =
                 mavlink.imu_status(tick, 1, ok, ok, h.whoami());
+                pump_write(usb_dev, serial, frame.as_slice());
+            } if tick % 500 == 450
+            {
+                let l = prox_left.lock(| p | * p); let mut s : heapless ::
+                String < 50 > = heapless :: String :: new(); let _ = write!
+                (s, "L rx={} fr={} ck={} d={} a={}", l.rx_bytes, l.frames,
+                l.checksum_errors, l.distance_cm, l.amplitude); let frame =
+                mavlink.statustext(6, & s);
                 pump_write(usb_dev, serial, frame.as_slice());
             } tick = tick.wrapping_add(1); Mono :: delay(1.millis()).await;
         }

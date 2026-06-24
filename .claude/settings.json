@@ -7,7 +7,12 @@
       "Bash(cd /home/poorcsky/Documents/scky_firmware *)",
       "Bash(echo \"\\(grep exit $?\\)\")",
       "Bash(xargs -I{} echo \"warning/error lines: {}\")",
-      "WebFetch(domain:ardupilot.org)"
+      "WebFetch(domain:ardupilot.org)",
+      "Bash(python3 -c \"import pymavlink; print\\('pymavlink ok'\\)\")",
+      "Bash(python3 -c \"import serial; print\\('pyserial ok'\\)\")",
+      "Bash(chmod +x /home/poorcsky/Documents/scky_firmware/tests/lidar-debug.py)",
+      "Bash(python3 /home/poorcsky/Documents/scky_firmware/tests/lidar-debug.py --help)",
+      "Bash(probe-rs list *)"
     ],
     "additionalDirectories": [
       "/home/poorcsky/Documents/scky_firmware/src"
