@@ -13,19 +13,37 @@
     Rx; use stm32h7xx_hal :: usb_hs :: { UsbBus, USB2 }; use stm32h7xx_hal ::
     { i2c, pac, spi }; use usb_device :: prelude :: * ; use crate :: ahrs ::
     Attitude; use crate :: baro :: { Baro, BaroData }; use crate :: compass ::
-    { Compass, MagData }; use crate :: crsf :: { CrsfParser, RcChannels }; use
+    { Compass, MagCal, MagData, MagRotation }; use crate :: crsf ::
+    { CrsfParser, RcChannels }; use crate :: ekf :: { Ekf, NavSolution }; use
     crate :: estimator :: { Estimator, Rotation }; use crate :: filters ::
     ImuLpf; use crate :: gps :: { GpsData, NmeaParser }; use crate :: imu ::
     { Health, Imu, ImuOut }; use crate :: mavlink ::
     {
         Encoder, MAV_SYS_STATUS_SENSOR_3D_ACCEL, MAV_SYS_STATUS_SENSOR_3D_GYRO
     }; use crate :: mtf01 :: { Mtf01Data, MspParser }; use crate :: nav ::
-    { Nav, NavState };
+    { Nav, NavState }; use crate :: tfluna :: { TfLunaData, TfLunaParser };
     #[doc =
     " Tasks tick at 1 kHz (Systick monotonic), so the filter sample rate and"]
     #[doc = " fusion step are both 1 ms."] const SAMPLE_HZ : f32 = 1000.0;
     const DT : f32 = 1.0 / SAMPLE_HZ; const DEG2RAD : f32 = core :: f32 ::
-    consts :: PI / 180.0; const GYRO_CUTOFF_HZ : f32 = 80.0; const
+    consts :: PI / 180.0;
+    #[doc =
+    " Magnetic declination at your location, degrees east-positive. 0 leaves the"]
+    #[doc =
+    " heading magnetic (EKF horizontal will be rotated by the local declination)."]
+    const MAG_DECLINATION_DEG : f32 = 0.0;
+    #[doc = " Compass mount orientation relative to the FC."] const
+    MAG_ROTATION : MagRotation = MagRotation :: None;
+    #[doc =
+    " Hard-iron offset (Gauss) and soft-iron scale — from a bench calibration or"]
+    #[doc = " the in-field RC-triggered collector. Identity until measured."]
+    const MAG_OFFSET : [f32; 3] = [0.0; 3]; const MAG_SCALE : [f32; 3] =
+    [1.0; 3];
+    #[doc =
+    " RC channel (0-based) whose high position triggers in-field compass"]
+    #[doc =
+    " calibration: flip high, fly figure-8s, flip low to store. AUX by default."]
+    const CAL_RC_CHANNEL : usize = 6; const GYRO_CUTOFF_HZ : f32 = 80.0; const
     ACCEL_CUTOFF_HZ : f32 = 20.0; const AHRS_KP : f32 = 1.0; const AHRS_KI :
     f32 = 0.05;
     #[doc =
@@ -36,10 +54,12 @@
     GPS_BAUD : u32 = 9600; #[doc = " MTF-01 MSP output baud (USART2)."] const
     MTF01_BAUD : u32 = 115_200;
     #[doc = " ExpressLRS / CRSF baud (UART5). ELRS uses 420 kbaud."] const
-    CRSF_BAUD : u32 = 420_000; type Imu1 = Imu < spi :: Spi < pac :: SPI1, spi
-    :: Enabled > , Pin < 'A', 4, Output > > ; type Imu2 = Imu < spi :: Spi <
-    pac :: SPI4, spi :: Enabled > , Pin < 'B', 1, Output > > ; type I2c2 = i2c
-    :: I2c < pac :: I2C2 > ; type MyUsbBus = UsbBus < USB2 > ;
+    CRSF_BAUD : u32 = 420_000;
+    #[doc = " TF-Luna side-lidar baud (USART6 / UART7). Default is 115200."]
+    const TFLUNA_BAUD : u32 = 115_200; type Imu1 = Imu < spi :: Spi < pac ::
+    SPI1, spi :: Enabled > , Pin < 'A', 4, Output > > ; type Imu2 = Imu < spi
+    :: Spi < pac :: SPI4, spi :: Enabled > , Pin < 'B', 1, Output > > ; type
+    I2c2 = i2c :: I2c < pac :: I2C2 > ; type MyUsbBus = UsbBus < USB2 > ;
     #[doc =
     " Write a buffer to the CDC IN endpoint in one non-blocking call. Frames"]
     #[doc =
@@ -85,6 +105,14 @@
         : RcChannels,
         #[doc = " Flow/lidar navigation estimate, published by the nav task."]
         navs : NavState,
+        #[doc =
+        " Side obstacle lidars, published by the USART6 / UART7 interrupts."]
+        prox_left : TfLunaData, prox_right : TfLunaData,
+        #[doc =
+        " World-frame (N/E/Up) gravity-removed acceleration, published by the"]
+        #[doc = " estimator for the EKF prediction step."] accel_w : [f32; 3],
+        #[doc = " Fused navigation solution, published by the EKF task."]
+        navsol : NavSolution,
     } #[doc = r"Local resources"] struct Local
     {
         imu1 : Imu1, lpf1 : ImuLpf, imu2 : Imu2, lpf2 : ImuLpf, est :
@@ -93,7 +121,9 @@
         gps_rx : Rx < pac :: USART1 > , gps_parser : NmeaParser, i2c2 : I2c2,
         compass : Compass, baro : Baro, mtf_rx : Rx < pac :: USART2 > ,
         mtf_parser : MspParser, crsf_rx : Rx < pac :: UART5 > , crsf_parser :
-        CrsfParser, nav : Nav,
+        CrsfParser, nav : Nav, tfl_left_rx : Rx < pac :: USART6 > ,
+        tfl_left_parser : TfLunaParser, tfl_right_rx : Rx < pac :: UART7 > ,
+        tfl_right_parser : TfLunaParser, ekf : Ekf,
     } #[doc = r" Execution context"] #[allow(non_snake_case)]
     #[allow(non_camel_case_types)] pub struct __rtic_internal_init_Context <
     'a >
@@ -135,7 +165,8 @@
         ccdr.peripheral.kernel_spi123_clk_mux(Spi123ClkSel :: Per); Mono ::
         start(cp.SYST, 64_000_000); let gpioa =
         dp.GPIOA.split(ccdr.peripheral.GPIOA); let gpiob =
-        dp.GPIOB.split(ccdr.peripheral.GPIOB); let gpiod =
+        dp.GPIOB.split(ccdr.peripheral.GPIOB); let gpioc =
+        dp.GPIOC.split(ccdr.peripheral.GPIOC); let gpiod =
         dp.GPIOD.split(ccdr.peripheral.GPIOD); let gpioe =
         dp.GPIOE.split(ccdr.peripheral.GPIOE); let spi1 =
         dp.SPI1.spi((gpioa.pa5.into_alternate :: < 5 > (),
@@ -167,8 +198,18 @@
         dp.UART5.serial((gpiob.pb6.into_alternate :: < 14 > (),
         gpiob.pb5.into_alternate :: < 14 > (),), CRSF_BAUD.bps(),
         ccdr.peripheral.UART5, & ccdr.clocks,).unwrap(); let
-        (_crsf_tx, mut crsf_rx) = serial5.split(); crsf_rx.listen(); let usb =
-        USB2 ::
+        (_crsf_tx, mut crsf_rx) = serial5.split(); crsf_rx.listen(); let
+        serial6 =
+        dp.USART6.serial((gpioc.pc6.into_alternate :: < 7 > (),
+        gpioc.pc7.into_alternate :: < 7 > (),), TFLUNA_BAUD.bps(),
+        ccdr.peripheral.USART6, & ccdr.clocks,).unwrap(); let
+        (_tfl_l_tx, mut tfl_left_rx) = serial6.split(); tfl_left_rx.listen();
+        let serial7 =
+        dp.UART7.serial((gpioe.pe8.into_alternate :: < 7 > (),
+        gpioe.pe7.into_alternate :: < 7 > (),), TFLUNA_BAUD.bps(),
+        ccdr.peripheral.UART7, & ccdr.clocks,).unwrap(); let
+        (_tfl_r_tx, mut tfl_right_rx) = serial7.split();
+        tfl_right_rx.listen(); let usb = USB2 ::
         new(dp.OTG2_HS_GLOBAL, dp.OTG2_HS_DEVICE, dp.OTG2_HS_PWRCLK,
         gpioa.pa11.into_alternate :: < 10 > (), gpioa.pa12.into_alternate :: <
         10 > (), ccdr.peripheral.USB2OTG, & ccdr.clocks,); let bus_ref : &
@@ -186,24 +227,32 @@
         default().manufacturer("scky").product("scky-fc H743").serial_number("0001")]).unwrap().device_class(usbd_serial
         :: USB_CLASS_CDC).build(); let lpf1 = ImuLpf ::
         new(SAMPLE_HZ, GYRO_CUTOFF_HZ, ACCEL_CUTOFF_HZ); let lpf2 = ImuLpf ::
-        new(SAMPLE_HZ, GYRO_CUTOFF_HZ, ACCEL_CUTOFF_HZ); let est = Estimator
-        :: new(AHRS_KP, AHRS_KI, Rotation :: Roll180, Rotation :: Pitch180);
+        new(SAMPLE_HZ, GYRO_CUTOFF_HZ, ACCEL_CUTOFF_HZ); let mut est =
+        Estimator ::
+        new(AHRS_KP, AHRS_KI, Rotation :: Roll180, Rotation :: Pitch180);
+        est.set_declination(MAG_DECLINATION_DEG);
+        est.set_mag_cal(MagCal :: new(MAG_ROTATION, MAG_OFFSET, MAG_SCALE));
         imu1_task :: spawn().ok(); imu2_task :: spawn().ok(); estimator_task
         :: spawn().ok(); i2c_task :: spawn().ok(); nav_task :: spawn().ok();
-        usb_task :: spawn().ok();
+        ekf_task :: spawn().ok(); usb_task :: spawn().ok();
         (Shared
         {
             out1 : ImuOut { health : h1, .. Default :: default() }, out2 :
             ImuOut { health : h2, .. Default :: default() }, att : Attitude ::
             default(), gps : GpsData :: default(), mag : MagData :: default(),
             baro : BaroData :: default(), flow : Mtf01Data :: default(), rc :
-            RcChannels :: default(), navs : NavState :: default(),
+            RcChannels :: default(), navs : NavState :: default(), prox_left :
+            TfLunaData :: default(), prox_right : TfLunaData :: default(),
+            accel_w : [0.0; 3], navsol : NavSolution :: default(),
         }, Local
         {
             imu1, lpf1, imu2, lpf2, est, usb_dev, serial, mavlink : Encoder ::
             new(), gps_rx, gps_parser : NmeaParser :: new(), i2c2, compass,
             baro, mtf_rx, mtf_parser : MspParser :: new(), crsf_rx,
             crsf_parser : CrsfParser :: new(), nav : Nav :: new(),
+            tfl_left_rx, tfl_left_parser : TfLunaParser :: new(),
+            tfl_right_rx, tfl_right_parser : TfLunaParser :: new(), ekf : Ekf
+            :: new(),
         },)
     } #[allow(non_snake_case)] #[no_mangle] unsafe fn USART1()
     {
@@ -289,6 +338,66 @@
             __rtic_internal_uart5_rxSharedResources
             {
                 rc : shared_resources :: rc_that_needs_to_be_locked :: new(),
+                __rtic_internal_marker : core :: marker :: PhantomData,
+            }
+        }
+    } #[allow(non_snake_case)] #[no_mangle] unsafe fn USART6()
+    {
+        const PRIORITY : u8 = 4u8; rtic :: export ::
+        run(PRIORITY, || { usart6_rx(usart6_rx :: Context :: new()) });
+    } impl < 'a > __rtic_internal_usart6_rxLocalResources < 'a >
+    {
+        #[inline(always)] #[allow(missing_docs)] pub unsafe fn new() -> Self
+        {
+            __rtic_internal_usart6_rxLocalResources
+            {
+                tfl_left_rx : & mut *
+                (& mut *
+                __rtic_internal_local_resource_tfl_left_rx.get_mut()).as_mut_ptr(),
+                tfl_left_parser : & mut *
+                (& mut *
+                __rtic_internal_local_resource_tfl_left_parser.get_mut()).as_mut_ptr(),
+                __rtic_internal_marker : :: core :: marker :: PhantomData,
+            }
+        }
+    } impl < 'a > __rtic_internal_usart6_rxSharedResources < 'a >
+    {
+        #[inline(always)] #[allow(missing_docs)] pub unsafe fn new() -> Self
+        {
+            __rtic_internal_usart6_rxSharedResources
+            {
+                prox_left : shared_resources ::
+                prox_left_that_needs_to_be_locked :: new(),
+                __rtic_internal_marker : core :: marker :: PhantomData,
+            }
+        }
+    } #[allow(non_snake_case)] #[no_mangle] unsafe fn UART7()
+    {
+        const PRIORITY : u8 = 4u8; rtic :: export ::
+        run(PRIORITY, || { uart7_rx(uart7_rx :: Context :: new()) });
+    } impl < 'a > __rtic_internal_uart7_rxLocalResources < 'a >
+    {
+        #[inline(always)] #[allow(missing_docs)] pub unsafe fn new() -> Self
+        {
+            __rtic_internal_uart7_rxLocalResources
+            {
+                tfl_right_rx : & mut *
+                (& mut *
+                __rtic_internal_local_resource_tfl_right_rx.get_mut()).as_mut_ptr(),
+                tfl_right_parser : & mut *
+                (& mut *
+                __rtic_internal_local_resource_tfl_right_parser.get_mut()).as_mut_ptr(),
+                __rtic_internal_marker : :: core :: marker :: PhantomData,
+            }
+        }
+    } impl < 'a > __rtic_internal_uart7_rxSharedResources < 'a >
+    {
+        #[inline(always)] #[allow(missing_docs)] pub unsafe fn new() -> Self
+        {
+            __rtic_internal_uart7_rxSharedResources
+            {
+                prox_right : shared_resources ::
+                prox_right_that_needs_to_be_locked :: new(),
                 __rtic_internal_marker : core :: marker :: PhantomData,
             }
         }
@@ -420,6 +529,91 @@
         __rtic_internal_uart5_rxSharedResources as SharedResources;
         #[doc(inline)] pub use super :: __rtic_internal_uart5_rx_Context as
         Context;
+    } #[allow(non_snake_case)] #[allow(non_camel_case_types)]
+    #[doc = "Local resources `usart6_rx` has access to"] pub struct
+    __rtic_internal_usart6_rxLocalResources < 'a >
+    {
+        #[allow(missing_docs)] pub tfl_left_rx : & 'a mut Rx < pac :: USART6 >
+        , #[allow(missing_docs)] pub tfl_left_parser : & 'a mut TfLunaParser,
+        #[doc(hidden)] pub __rtic_internal_marker : :: core :: marker ::
+        PhantomData < & 'a () > ,
+    } #[allow(non_snake_case)] #[allow(non_camel_case_types)]
+    #[doc = "Shared resources `usart6_rx` has access to"] pub struct
+    __rtic_internal_usart6_rxSharedResources < 'a >
+    {
+        #[allow(missing_docs)] pub prox_left : shared_resources ::
+        prox_left_that_needs_to_be_locked < 'a > , #[doc(hidden)] pub
+        __rtic_internal_marker : core :: marker :: PhantomData < & 'a () > ,
+    } #[doc = r" Execution context"] #[allow(non_snake_case)]
+    #[allow(non_camel_case_types)] pub struct
+    __rtic_internal_usart6_rx_Context < 'a >
+    {
+        #[doc(hidden)] __rtic_internal_p : :: core :: marker :: PhantomData <
+        & 'a () > , #[doc = r" Local Resources this task has access to"] pub
+        local : usart6_rx :: LocalResources < 'a > ,
+        #[doc = r" Shared Resources this task has access to"] pub shared :
+        usart6_rx :: SharedResources < 'a > ,
+    } impl < 'a > __rtic_internal_usart6_rx_Context < 'a >
+    {
+        #[inline(always)] #[allow(missing_docs)] pub unsafe fn new() -> Self
+        {
+            __rtic_internal_usart6_rx_Context
+            {
+                __rtic_internal_p : :: core :: marker :: PhantomData, local :
+                usart6_rx :: LocalResources :: new(), shared : usart6_rx ::
+                SharedResources :: new(),
+            }
+        }
+    } #[allow(non_snake_case)] #[doc = "Hardware task"] pub mod usart6_rx
+    {
+        #[doc(inline)] pub use super ::
+        __rtic_internal_usart6_rxLocalResources as LocalResources;
+        #[doc(inline)] pub use super ::
+        __rtic_internal_usart6_rxSharedResources as SharedResources;
+        #[doc(inline)] pub use super :: __rtic_internal_usart6_rx_Context as
+        Context;
+    } #[allow(non_snake_case)] #[allow(non_camel_case_types)]
+    #[doc = "Local resources `uart7_rx` has access to"] pub struct
+    __rtic_internal_uart7_rxLocalResources < 'a >
+    {
+        #[allow(missing_docs)] pub tfl_right_rx : & 'a mut Rx < pac :: UART7 >
+        , #[allow(missing_docs)] pub tfl_right_parser : & 'a mut TfLunaParser,
+        #[doc(hidden)] pub __rtic_internal_marker : :: core :: marker ::
+        PhantomData < & 'a () > ,
+    } #[allow(non_snake_case)] #[allow(non_camel_case_types)]
+    #[doc = "Shared resources `uart7_rx` has access to"] pub struct
+    __rtic_internal_uart7_rxSharedResources < 'a >
+    {
+        #[allow(missing_docs)] pub prox_right : shared_resources ::
+        prox_right_that_needs_to_be_locked < 'a > , #[doc(hidden)] pub
+        __rtic_internal_marker : core :: marker :: PhantomData < & 'a () > ,
+    } #[doc = r" Execution context"] #[allow(non_snake_case)]
+    #[allow(non_camel_case_types)] pub struct __rtic_internal_uart7_rx_Context
+    < 'a >
+    {
+        #[doc(hidden)] __rtic_internal_p : :: core :: marker :: PhantomData <
+        & 'a () > , #[doc = r" Local Resources this task has access to"] pub
+        local : uart7_rx :: LocalResources < 'a > ,
+        #[doc = r" Shared Resources this task has access to"] pub shared :
+        uart7_rx :: SharedResources < 'a > ,
+    } impl < 'a > __rtic_internal_uart7_rx_Context < 'a >
+    {
+        #[inline(always)] #[allow(missing_docs)] pub unsafe fn new() -> Self
+        {
+            __rtic_internal_uart7_rx_Context
+            {
+                __rtic_internal_p : :: core :: marker :: PhantomData, local :
+                uart7_rx :: LocalResources :: new(), shared : uart7_rx ::
+                SharedResources :: new(),
+            }
+        }
+    } #[allow(non_snake_case)] #[doc = "Hardware task"] pub mod uart7_rx
+    {
+        #[doc(inline)] pub use super :: __rtic_internal_uart7_rxLocalResources
+        as LocalResources; #[doc(inline)] pub use super ::
+        __rtic_internal_uart7_rxSharedResources as SharedResources;
+        #[doc(inline)] pub use super :: __rtic_internal_uart7_rx_Context as
+        Context;
     } #[allow(non_snake_case)] fn usart1_rx(mut cx : usart1_rx :: Context)
     {
         use rtic :: Mutex as _; use rtic :: mutex :: prelude :: * ; let parser
@@ -441,6 +635,26 @@
         cx.local.crsf_rx.read() { if parser.push(byte) { updated = true; } }
         if updated
         { let data = parser.data(); cx.shared.rc.lock(| r | * r = data); }
+    } #[allow(non_snake_case)] fn usart6_rx(mut cx : usart6_rx :: Context)
+    {
+        use rtic :: Mutex as _; use rtic :: mutex :: prelude :: * ; let parser
+        = cx.local.tfl_left_parser; let mut updated = false; while let
+        Ok(byte) = cx.local.tfl_left_rx.read()
+        { if parser.push(byte) { updated = true; } } if updated
+        {
+            let data = parser.data();
+            cx.shared.prox_left.lock(| p | * p = data);
+        }
+    } #[allow(non_snake_case)] fn uart7_rx(mut cx : uart7_rx :: Context)
+    {
+        use rtic :: Mutex as _; use rtic :: mutex :: prelude :: * ; let parser
+        = cx.local.tfl_right_parser; let mut updated = false; while let
+        Ok(byte) = cx.local.tfl_right_rx.read()
+        { if parser.push(byte) { updated = true; } } if updated
+        {
+            let data = parser.data();
+            cx.shared.prox_right.lock(| p | * p = data);
+        }
     } impl < 'a > __rtic_internal_imu1_taskLocalResources < 'a >
     {
         #[inline(always)] #[allow(missing_docs)] pub unsafe fn new() -> Self
@@ -513,7 +727,9 @@
                 new(), out2 : shared_resources :: out2_that_needs_to_be_locked
                 :: new(), att : shared_resources ::
                 att_that_needs_to_be_locked :: new(), mag : shared_resources
-                :: mag_that_needs_to_be_locked :: new(),
+                :: mag_that_needs_to_be_locked :: new(), accel_w :
+                shared_resources :: accel_w_that_needs_to_be_locked :: new(),
+                rc : shared_resources :: rc_that_needs_to_be_locked :: new(),
                 __rtic_internal_marker : core :: marker :: PhantomData,
             }
         }
@@ -572,6 +788,33 @@
                 : core :: marker :: PhantomData,
             }
         }
+    } impl < 'a > __rtic_internal_ekf_taskLocalResources < 'a >
+    {
+        #[inline(always)] #[allow(missing_docs)] pub unsafe fn new() -> Self
+        {
+            __rtic_internal_ekf_taskLocalResources
+            {
+                ekf : & mut *
+                (& mut *
+                __rtic_internal_local_resource_ekf.get_mut()).as_mut_ptr(),
+                __rtic_internal_marker : :: core :: marker :: PhantomData,
+            }
+        }
+    } impl < 'a > __rtic_internal_ekf_taskSharedResources < 'a >
+    {
+        #[inline(always)] #[allow(missing_docs)] pub unsafe fn new() -> Self
+        {
+            __rtic_internal_ekf_taskSharedResources
+            {
+                accel_w : shared_resources :: accel_w_that_needs_to_be_locked
+                :: new(), gps : shared_resources ::
+                gps_that_needs_to_be_locked :: new(), baro : shared_resources
+                :: baro_that_needs_to_be_locked :: new(), navs :
+                shared_resources :: navs_that_needs_to_be_locked :: new(),
+                navsol : shared_resources :: navsol_that_needs_to_be_locked ::
+                new(), __rtic_internal_marker : core :: marker :: PhantomData,
+            }
+        }
     } impl < 'a > __rtic_internal_usb_taskLocalResources < 'a >
     {
         #[inline(always)] #[allow(missing_docs)] pub unsafe fn new() -> Self
@@ -606,8 +849,12 @@
                 rc : shared_resources :: rc_that_needs_to_be_locked :: new(),
                 navs : shared_resources :: navs_that_needs_to_be_locked ::
                 new(), baro : shared_resources :: baro_that_needs_to_be_locked
-                :: new(), __rtic_internal_marker : core :: marker ::
-                PhantomData,
+                :: new(), prox_left : shared_resources ::
+                prox_left_that_needs_to_be_locked :: new(), prox_right :
+                shared_resources :: prox_right_that_needs_to_be_locked ::
+                new(), navsol : shared_resources ::
+                navsol_that_needs_to_be_locked :: new(),
+                __rtic_internal_marker : core :: marker :: PhantomData,
             }
         }
     } #[allow(non_snake_case)] #[allow(non_camel_case_types)]
@@ -779,6 +1026,9 @@
         #[allow(missing_docs)] pub att : shared_resources ::
         att_that_needs_to_be_locked < 'a > , #[allow(missing_docs)] pub mag :
         shared_resources :: mag_that_needs_to_be_locked < 'a > ,
+        #[allow(missing_docs)] pub accel_w : shared_resources ::
+        accel_w_that_needs_to_be_locked < 'a > , #[allow(missing_docs)] pub rc
+        : shared_resources :: rc_that_needs_to_be_locked < 'a > ,
         #[doc(hidden)] pub __rtic_internal_marker : core :: marker ::
         PhantomData < & 'a () > ,
     } #[doc = r" Execution context"] #[allow(non_snake_case)]
@@ -1000,6 +1250,86 @@
         __rtic_internal_nav_task_spawn as spawn; #[doc(inline)] pub use super
         :: __rtic_internal_nav_task_waker as waker;
     } #[allow(non_snake_case)] #[allow(non_camel_case_types)]
+    #[doc = "Local resources `ekf_task` has access to"] pub struct
+    __rtic_internal_ekf_taskLocalResources < 'a >
+    {
+        #[allow(missing_docs)] pub ekf : & 'a mut Ekf, #[doc(hidden)] pub
+        __rtic_internal_marker : :: core :: marker :: PhantomData < & 'a () >
+        ,
+    } #[allow(non_snake_case)] #[allow(non_camel_case_types)]
+    #[doc = "Shared resources `ekf_task` has access to"] pub struct
+    __rtic_internal_ekf_taskSharedResources < 'a >
+    {
+        #[allow(missing_docs)] pub accel_w : shared_resources ::
+        accel_w_that_needs_to_be_locked < 'a > , #[allow(missing_docs)] pub
+        gps : shared_resources :: gps_that_needs_to_be_locked < 'a > ,
+        #[allow(missing_docs)] pub baro : shared_resources ::
+        baro_that_needs_to_be_locked < 'a > , #[allow(missing_docs)] pub navs
+        : shared_resources :: navs_that_needs_to_be_locked < 'a > ,
+        #[allow(missing_docs)] pub navsol : shared_resources ::
+        navsol_that_needs_to_be_locked < 'a > , #[doc(hidden)] pub
+        __rtic_internal_marker : core :: marker :: PhantomData < & 'a () > ,
+    } #[doc = r" Execution context"] #[allow(non_snake_case)]
+    #[allow(non_camel_case_types)] pub struct __rtic_internal_ekf_task_Context
+    < 'a >
+    {
+        #[doc(hidden)] __rtic_internal_p : :: core :: marker :: PhantomData <
+        & 'a () > , #[doc = r" Local Resources this task has access to"] pub
+        local : ekf_task :: LocalResources < 'a > ,
+        #[doc = r" Shared Resources this task has access to"] pub shared :
+        ekf_task :: SharedResources < 'a > ,
+    } impl < 'a > __rtic_internal_ekf_task_Context < 'a >
+    {
+        #[inline(always)] #[allow(missing_docs)] pub unsafe fn new() -> Self
+        {
+            __rtic_internal_ekf_task_Context
+            {
+                __rtic_internal_p : :: core :: marker :: PhantomData, local :
+                ekf_task :: LocalResources :: new(), shared : ekf_task ::
+                SharedResources :: new(),
+            }
+        }
+    } #[doc = r" Spawns the task directly"] #[allow(non_snake_case)]
+    #[doc(hidden)] pub fn __rtic_internal_ekf_task_spawn() -> :: core ::
+    result :: Result < (), () >
+    {
+        unsafe
+        {
+            let exec = rtic :: export :: executor :: AsyncTaskExecutor ::
+            from_ptr_1_args(ekf_task, & __rtic_internal_ekf_task_EXEC); if
+            exec.try_allocate()
+            {
+                exec.spawn(ekf_task(unsafe { ekf_task :: Context :: new() }));
+                rtic :: export ::
+                pend(stm32h7xx_hal :: pac :: interrupt :: LPTIM1); Ok(())
+            } else { Err(()) }
+        }
+    } #[doc = r" Gives waker to the task"] #[allow(non_snake_case)]
+    #[doc(hidden)] pub fn __rtic_internal_ekf_task_waker() -> :: core :: task
+    :: Waker
+    {
+        unsafe
+        {
+            let exec = rtic :: export :: executor :: AsyncTaskExecutor ::
+            from_ptr_1_args(ekf_task, & __rtic_internal_ekf_task_EXEC);
+            exec.waker(||
+            {
+                let exec = rtic :: export :: executor :: AsyncTaskExecutor ::
+                from_ptr_1_args(ekf_task, & __rtic_internal_ekf_task_EXEC);
+                exec.set_pending(); rtic :: export ::
+                pend(stm32h7xx_hal :: pac :: interrupt :: LPTIM1);
+            })
+        }
+    } #[allow(non_snake_case)] #[doc = "Software task"] pub mod ekf_task
+    {
+        #[doc(inline)] pub use super :: __rtic_internal_ekf_taskLocalResources
+        as LocalResources; #[doc(inline)] pub use super ::
+        __rtic_internal_ekf_taskSharedResources as SharedResources;
+        #[doc(inline)] pub use super :: __rtic_internal_ekf_task_Context as
+        Context; #[doc(inline)] pub use super ::
+        __rtic_internal_ekf_task_spawn as spawn; #[doc(inline)] pub use super
+        :: __rtic_internal_ekf_task_waker as waker;
+    } #[allow(non_snake_case)] #[allow(non_camel_case_types)]
     #[doc = "Local resources `usb_task` has access to"] pub struct
     __rtic_internal_usb_taskLocalResources < 'a >
     {
@@ -1025,8 +1355,13 @@
         rc_that_needs_to_be_locked < 'a > , #[allow(missing_docs)] pub navs :
         shared_resources :: navs_that_needs_to_be_locked < 'a > ,
         #[allow(missing_docs)] pub baro : shared_resources ::
-        baro_that_needs_to_be_locked < 'a > , #[doc(hidden)] pub
-        __rtic_internal_marker : core :: marker :: PhantomData < & 'a () > ,
+        baro_that_needs_to_be_locked < 'a > , #[allow(missing_docs)] pub
+        prox_left : shared_resources :: prox_left_that_needs_to_be_locked < 'a
+        > , #[allow(missing_docs)] pub prox_right : shared_resources ::
+        prox_right_that_needs_to_be_locked < 'a > , #[allow(missing_docs)] pub
+        navsol : shared_resources :: navsol_that_needs_to_be_locked < 'a > ,
+        #[doc(hidden)] pub __rtic_internal_marker : core :: marker ::
+        PhantomData < & 'a () > ,
     } #[doc = r" Execution context"] #[allow(non_snake_case)]
     #[allow(non_camel_case_types)] pub struct __rtic_internal_usb_task_Context
     < 'a >
@@ -1122,13 +1457,20 @@
     {
         use rtic :: Mutex as _; use rtic :: mutex :: prelude :: * ; let est =
         cx.local.est; let estimator_task :: SharedResources
-        { mut out1, mut out2, mut att, mut mag, .. } = cx.shared; loop
+        { mut out1, mut out2, mut att, mut mag, mut accel_w, mut rc, .. } =
+        cx.shared; let mut cal_active = false; loop
         {
-            let o1 = out1.lock(| o | * o); let o2 = out2.lock(| o | * o); let
-            m = mag.lock(| m | * m); let mag_field =
-            m.healthy.then_some(m.field); let a =
-            est.update(& o1, & o2, mag_field, DT); att.lock(| x | * x = a);
-            Mono :: delay(1.millis()).await;
+            let ch = rc.lock(| r | r.ch_us(CAL_RC_CHANNEL)); if ch > 1700 && !
+            cal_active
+            { est.mag_cal_mut().start_collection(); cal_active = true; } else
+            if ch < 1300 && cal_active
+            { est.mag_cal_mut().finish_collection(); cal_active = false; } let
+            o1 = out1.lock(| o | * o); let o2 = out2.lock(| o | * o); let m =
+            mag.lock(| m | * m); let mag_field = m.healthy.then_some(m.field);
+            let a = est.update(& o1, & o2, mag_field, DT);
+            att.lock(| x | * x = a);
+            accel_w.lock(| x | * x = est.accel_world()); Mono ::
+            delay(1.millis()).await;
         }
     } #[allow(non_snake_case)] async fn i2c_task < 'a >
     (cx : i2c_task :: Context < 'a >)
@@ -1155,6 +1497,49 @@
             nav.update(& f, & a, NAV_DT); let s = nav.state();
             navs.lock(| n | * n = s); Mono :: delay(20.millis()).await;
         }
+    } #[allow(non_snake_case)] async fn ekf_task < 'a >
+    (cx : ekf_task :: Context < 'a >)
+    {
+        use rtic :: Mutex as _; use rtic :: mutex :: prelude :: * ; let ekf =
+        cx.local.ekf; let ekf_task :: SharedResources
+        { mut accel_w, mut gps, mut baro, mut navs, mut navsol, .. } =
+        cx.shared; const EKF_DT : f32 = 0.01; let mut last_gps_seq : u32 = 0;
+        let mut tick : u32 = 0; loop
+        {
+            let aw = accel_w.lock(| x | * x); ekf.predict(aw, EKF_DT); let g =
+            gps.lock(| g | * g); if g.fix_type >= 3 && g.sentences !=
+            last_gps_seq
+            {
+                last_gps_seq = g.sentences; let lat = g.lat_e7 as f32 *
+                1.0e-7; let lon = g.lon_e7 as f32 * 1.0e-7; let alt = g.alt_mm
+                as f32 * 1.0e-3; if ! ekf.origin_set()
+                { ekf.set_origin(lat, lon, alt); } let (n, e) =
+                ekf.gps_to_local(lat, lon);
+                ekf.fuse_gps_pos(n, e, g.eph as f32 / 100.0); if g.cog_cdeg !=
+                u16 :: MAX && g.vel_cms > 0
+                {
+                    let cog = (g.cog_cdeg as f32 / 100.0) * DEG2RAD; let v =
+                    g.vel_cms as f32 / 100.0;
+                    ekf.fuse_gps_vel(v * libm :: cosf(cog), v * libm ::
+                    sinf(cog));
+                }
+            } if tick % 10 == 0
+            {
+                let b = baro.lock(| b | * b); if b.healthy
+                { ekf.fuse_baro(b.rel_altitude_m); }
+            } if tick % 5 == 0
+            {
+                let nv = navs.lock(| n | * n); if nv.height_valid
+                {
+                    ekf.fuse_lidar(nv.height_m); if nv.flow_quality >= 30
+                    {
+                        ekf.fuse_flow_vel(nv.vx, nv.vy, nv.flow_quality as f32 /
+                        255.0);
+                    }
+                }
+            } navsol.lock(| x | * x = ekf.solution()); tick =
+            tick.wrapping_add(1); Mono :: delay(10.millis()).await;
+        }
     } #[allow(non_snake_case)] async fn usb_task < 'a >
     (cx : usb_task :: Context < 'a >)
     {
@@ -1163,7 +1548,7 @@
         = cx.local.mavlink; let usb_task :: SharedResources
         {
             mut out1, mut out2, mut gps, mut mag, mut att, mut flow, mut rc,
-            mut navs, mut baro, ..
+            mut navs, mut baro, mut prox_left, mut prox_right, mut navsol, ..
         } = cx.shared; let mut tick : u32 = 0; loop
         {
             usb_dev.poll(& mut [serial]);
@@ -1211,31 +1596,61 @@
                 pump_write(usb_dev, serial, frame.as_slice());
             } if tick % 200 == 60
             {
-                let g = gps.lock(| g | * g); let yaw_deg =
-                att.lock(| x | x.yaw); let hdg =
+                let g = gps.lock(| g | * g); let sol = navsol.lock(| s | * s);
+                let yaw_deg = att.lock(| x | x.yaw); let hdg =
                 {
                     let mut h = yaw_deg; while h < 0.0 { h += 360.0; } while h
                     >= 360.0 { h -= 360.0; } (h * 100.0) as u16
-                }; let (vx, vy) = if g.cog_cdeg != u16 :: MAX
+                }; let (lat_e7, lon_e7, alt_mm, rel_alt_mm, vx, vy, vz) = if
+                sol.converged
                 {
-                    let cog = (g.cog_cdeg as f32 / 100.0) * DEG2RAD; let v =
-                    g.vel_cms as f32;
-                    ((v * libm :: cosf(cog)) as i16, (v * libm :: sinf(cog)) as
-                    i16)
-                } else { (0, 0) }; let n = navs.lock(| n | * n); let rel_alt =
-                if n.height_valid { (n.height_m * 1000.0) as i32 } else { 0 };
-                let frame =
-                mavlink.global_position_int(tick, g.lat_e7, g.lon_e7,
-                g.alt_mm, rel_alt, vx, vy, 0, hdg,);
+                    (sol.lat_e7, sol.lon_e7, sol.alt_mm, sol.rel_alt_mm,
+                    (sol.vel [0] * 100.0) as i16, (sol.vel [1] * 100.0) as i16,
+                    (- sol.vel [2] * 100.0) as i16,)
+                } else
+                {
+                    let (vx, vy) = if g.cog_cdeg != u16 :: MAX
+                    {
+                        let cog = (g.cog_cdeg as f32 / 100.0) * DEG2RAD; let v =
+                        g.vel_cms as f32;
+                        ((v * libm :: cosf(cog)) as i16, (v * libm :: sinf(cog)) as
+                        i16)
+                    } else { (0, 0) };
+                    (g.lat_e7, g.lon_e7, g.alt_mm, 0, vx, vy, 0)
+                }; let frame =
+                mavlink.global_position_int(tick, lat_e7, lon_e7, alt_mm,
+                rel_alt_mm, vx, vy, vz, hdg,);
                 pump_write(usb_dev, serial, frame.as_slice());
+            } if tick % 100 == 50
+            {
+                let sol = navsol.lock(| s | * s); if sol.converged
+                {
+                    let frame =
+                    mavlink.local_position_ned(tick, sol.pos [0], sol.pos [1], -
+                    sol.pos [2], sol.vel [0], sol.vel [1], - sol.vel [2],);
+                    pump_write(usb_dev, serial, frame.as_slice());
+                }
             } if tick % 100 == 70
             {
                 let f = flow.lock(| f | * f); if f.dist_valid
                 {
                     let cm = (f.dist_mm / 10).clamp(0, u16 :: MAX as i32) as
-                    u16; let frame = mavlink.distance_sensor(tick, 2, 800, cm);
+                    u16; let frame =
+                    mavlink.distance_sensor(tick, 2, 800, cm, 25, 0);
                     pump_write(usb_dev, serial, frame.as_slice());
                 }
+            } if tick % 66 == 33
+            {
+                let l = prox_left.lock(| p | * p); let r =
+                prox_right.lock(| p | * p); let lcm = if l.valid
+                { l.distance_cm } else { tfluna :: MAX_CM }; let rcm = if
+                r.valid { r.distance_cm } else { tfluna :: MAX_CM }; let fl =
+                mavlink.distance_sensor(tick, tfluna :: MIN_CM, tfluna ::
+                MAX_CM, lcm, 6, 1);
+                pump_write(usb_dev, serial, fl.as_slice()); let fr =
+                mavlink.distance_sensor(tick, tfluna :: MIN_CM, tfluna ::
+                MAX_CM, rcm, 2, 2);
+                pump_write(usb_dev, serial, fr.as_slice());
             } if tick % 50 == 35
             {
                 let f = flow.lock(| f | * f); let n = navs.lock(| n | * n); if
@@ -1452,6 +1867,78 @@
                 _, CEILING, stm32h7xx_hal :: pac :: NVIC_PRIO_BITS, f,)
             }
         }
+    } #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
+    #[doc(hidden)] #[link_section = ".uninit.rtic9"] static
+    __rtic_internal_shared_resource_prox_left : rtic :: RacyCell < core :: mem
+    :: MaybeUninit < TfLunaData >> = rtic :: RacyCell ::
+    new(core :: mem :: MaybeUninit :: uninit()); impl < 'a > rtic :: Mutex for
+    shared_resources :: prox_left_that_needs_to_be_locked < 'a >
+    {
+        type T = TfLunaData; #[inline(always)] fn lock < RTIC_INTERNAL_R >
+        (& mut self, f : impl FnOnce(& mut TfLunaData) -> RTIC_INTERNAL_R) ->
+        RTIC_INTERNAL_R
+        {
+            #[doc = r" Priority ceiling"] const CEILING : u8 = 4u8; unsafe
+            {
+                rtic :: export ::
+                lock(__rtic_internal_shared_resource_prox_left.get_mut() as *
+                mut _, CEILING, stm32h7xx_hal :: pac :: NVIC_PRIO_BITS, f,)
+            }
+        }
+    } #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
+    #[doc(hidden)] #[link_section = ".uninit.rtic10"] static
+    __rtic_internal_shared_resource_prox_right : rtic :: RacyCell < core ::
+    mem :: MaybeUninit < TfLunaData >> = rtic :: RacyCell ::
+    new(core :: mem :: MaybeUninit :: uninit()); impl < 'a > rtic :: Mutex for
+    shared_resources :: prox_right_that_needs_to_be_locked < 'a >
+    {
+        type T = TfLunaData; #[inline(always)] fn lock < RTIC_INTERNAL_R >
+        (& mut self, f : impl FnOnce(& mut TfLunaData) -> RTIC_INTERNAL_R) ->
+        RTIC_INTERNAL_R
+        {
+            #[doc = r" Priority ceiling"] const CEILING : u8 = 4u8; unsafe
+            {
+                rtic :: export ::
+                lock(__rtic_internal_shared_resource_prox_right.get_mut() as *
+                mut _, CEILING, stm32h7xx_hal :: pac :: NVIC_PRIO_BITS, f,)
+            }
+        }
+    } #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
+    #[doc(hidden)] #[link_section = ".uninit.rtic11"] static
+    __rtic_internal_shared_resource_accel_w : rtic :: RacyCell < core :: mem
+    :: MaybeUninit < [f32; 3] >> = rtic :: RacyCell ::
+    new(core :: mem :: MaybeUninit :: uninit()); impl < 'a > rtic :: Mutex for
+    shared_resources :: accel_w_that_needs_to_be_locked < 'a >
+    {
+        type T = [f32; 3]; #[inline(always)] fn lock < RTIC_INTERNAL_R >
+        (& mut self, f : impl FnOnce(& mut [f32; 3]) -> RTIC_INTERNAL_R) ->
+        RTIC_INTERNAL_R
+        {
+            #[doc = r" Priority ceiling"] const CEILING : u8 = 2u8; unsafe
+            {
+                rtic :: export ::
+                lock(__rtic_internal_shared_resource_accel_w.get_mut() as *
+                mut _, CEILING, stm32h7xx_hal :: pac :: NVIC_PRIO_BITS, f,)
+            }
+        }
+    } #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
+    #[doc(hidden)] #[link_section = ".uninit.rtic12"] static
+    __rtic_internal_shared_resource_navsol : rtic :: RacyCell < core :: mem ::
+    MaybeUninit < NavSolution >> = rtic :: RacyCell ::
+    new(core :: mem :: MaybeUninit :: uninit()); impl < 'a > rtic :: Mutex for
+    shared_resources :: navsol_that_needs_to_be_locked < 'a >
+    {
+        type T = NavSolution; #[inline(always)] fn lock < RTIC_INTERNAL_R >
+        (& mut self, f : impl FnOnce(& mut NavSolution) -> RTIC_INTERNAL_R) ->
+        RTIC_INTERNAL_R
+        {
+            #[doc = r" Priority ceiling"] const CEILING : u8 = 1u8; unsafe
+            {
+                rtic :: export ::
+                lock(__rtic_internal_shared_resource_navsol.get_mut() as * mut
+                _, CEILING, stm32h7xx_hal :: pac :: NVIC_PRIO_BITS, f,)
+            }
+        }
     } mod shared_resources
     {
         #[doc(hidden)] #[allow(non_camel_case_types)] pub struct
@@ -1544,96 +2031,161 @@
                 navs_that_needs_to_be_locked
                 { __rtic_internal_p : :: core :: marker :: PhantomData }
             }
+        } #[doc(hidden)] #[allow(non_camel_case_types)] pub struct
+        prox_left_that_needs_to_be_locked < 'a >
+        { __rtic_internal_p : :: core :: marker :: PhantomData < & 'a () > , }
+        impl < 'a > prox_left_that_needs_to_be_locked < 'a >
+        {
+            #[inline(always)] pub unsafe fn new() -> Self
+            {
+                prox_left_that_needs_to_be_locked
+                { __rtic_internal_p : :: core :: marker :: PhantomData }
+            }
+        } #[doc(hidden)] #[allow(non_camel_case_types)] pub struct
+        prox_right_that_needs_to_be_locked < 'a >
+        { __rtic_internal_p : :: core :: marker :: PhantomData < & 'a () > , }
+        impl < 'a > prox_right_that_needs_to_be_locked < 'a >
+        {
+            #[inline(always)] pub unsafe fn new() -> Self
+            {
+                prox_right_that_needs_to_be_locked
+                { __rtic_internal_p : :: core :: marker :: PhantomData }
+            }
+        } #[doc(hidden)] #[allow(non_camel_case_types)] pub struct
+        accel_w_that_needs_to_be_locked < 'a >
+        { __rtic_internal_p : :: core :: marker :: PhantomData < & 'a () > , }
+        impl < 'a > accel_w_that_needs_to_be_locked < 'a >
+        {
+            #[inline(always)] pub unsafe fn new() -> Self
+            {
+                accel_w_that_needs_to_be_locked
+                { __rtic_internal_p : :: core :: marker :: PhantomData }
+            }
+        } #[doc(hidden)] #[allow(non_camel_case_types)] pub struct
+        navsol_that_needs_to_be_locked < 'a >
+        { __rtic_internal_p : :: core :: marker :: PhantomData < & 'a () > , }
+        impl < 'a > navsol_that_needs_to_be_locked < 'a >
+        {
+            #[inline(always)] pub unsafe fn new() -> Self
+            {
+                navsol_that_needs_to_be_locked
+                { __rtic_internal_p : :: core :: marker :: PhantomData }
+            }
         }
     } #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
-    #[doc(hidden)] #[link_section = ".uninit.rtic9"] static
+    #[doc(hidden)] #[link_section = ".uninit.rtic13"] static
     __rtic_internal_local_resource_imu1 : rtic :: RacyCell < core :: mem ::
     MaybeUninit < Imu1 >> = rtic :: RacyCell ::
     new(core :: mem :: MaybeUninit :: uninit());
     #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
-    #[doc(hidden)] #[link_section = ".uninit.rtic10"] static
+    #[doc(hidden)] #[link_section = ".uninit.rtic14"] static
     __rtic_internal_local_resource_lpf1 : rtic :: RacyCell < core :: mem ::
     MaybeUninit < ImuLpf >> = rtic :: RacyCell ::
     new(core :: mem :: MaybeUninit :: uninit());
     #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
-    #[doc(hidden)] #[link_section = ".uninit.rtic11"] static
+    #[doc(hidden)] #[link_section = ".uninit.rtic15"] static
     __rtic_internal_local_resource_imu2 : rtic :: RacyCell < core :: mem ::
     MaybeUninit < Imu2 >> = rtic :: RacyCell ::
     new(core :: mem :: MaybeUninit :: uninit());
     #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
-    #[doc(hidden)] #[link_section = ".uninit.rtic12"] static
+    #[doc(hidden)] #[link_section = ".uninit.rtic16"] static
     __rtic_internal_local_resource_lpf2 : rtic :: RacyCell < core :: mem ::
     MaybeUninit < ImuLpf >> = rtic :: RacyCell ::
     new(core :: mem :: MaybeUninit :: uninit());
     #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
-    #[doc(hidden)] #[link_section = ".uninit.rtic13"] static
+    #[doc(hidden)] #[link_section = ".uninit.rtic17"] static
     __rtic_internal_local_resource_est : rtic :: RacyCell < core :: mem ::
     MaybeUninit < Estimator >> = rtic :: RacyCell ::
     new(core :: mem :: MaybeUninit :: uninit());
     #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
-    #[doc(hidden)] #[link_section = ".uninit.rtic14"] static
+    #[doc(hidden)] #[link_section = ".uninit.rtic18"] static
     __rtic_internal_local_resource_usb_dev : rtic :: RacyCell < core :: mem ::
     MaybeUninit < UsbDevice < 'static, MyUsbBus > >> = rtic :: RacyCell ::
     new(core :: mem :: MaybeUninit :: uninit());
     #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
-    #[doc(hidden)] #[link_section = ".uninit.rtic15"] static
+    #[doc(hidden)] #[link_section = ".uninit.rtic19"] static
     __rtic_internal_local_resource_serial : rtic :: RacyCell < core :: mem ::
     MaybeUninit < usbd_serial :: SerialPort < 'static, MyUsbBus > >> = rtic ::
     RacyCell :: new(core :: mem :: MaybeUninit :: uninit());
     #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
-    #[doc(hidden)] #[link_section = ".uninit.rtic16"] static
+    #[doc(hidden)] #[link_section = ".uninit.rtic20"] static
     __rtic_internal_local_resource_mavlink : rtic :: RacyCell < core :: mem ::
     MaybeUninit < Encoder >> = rtic :: RacyCell ::
     new(core :: mem :: MaybeUninit :: uninit());
     #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
-    #[doc(hidden)] #[link_section = ".uninit.rtic17"] static
+    #[doc(hidden)] #[link_section = ".uninit.rtic21"] static
     __rtic_internal_local_resource_gps_rx : rtic :: RacyCell < core :: mem ::
     MaybeUninit < Rx < pac :: USART1 > >> = rtic :: RacyCell ::
     new(core :: mem :: MaybeUninit :: uninit());
     #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
-    #[doc(hidden)] #[link_section = ".uninit.rtic18"] static
+    #[doc(hidden)] #[link_section = ".uninit.rtic22"] static
     __rtic_internal_local_resource_gps_parser : rtic :: RacyCell < core :: mem
     :: MaybeUninit < NmeaParser >> = rtic :: RacyCell ::
     new(core :: mem :: MaybeUninit :: uninit());
     #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
-    #[doc(hidden)] #[link_section = ".uninit.rtic19"] static
+    #[doc(hidden)] #[link_section = ".uninit.rtic23"] static
     __rtic_internal_local_resource_i2c2 : rtic :: RacyCell < core :: mem ::
     MaybeUninit < I2c2 >> = rtic :: RacyCell ::
     new(core :: mem :: MaybeUninit :: uninit());
     #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
-    #[doc(hidden)] #[link_section = ".uninit.rtic20"] static
+    #[doc(hidden)] #[link_section = ".uninit.rtic24"] static
     __rtic_internal_local_resource_compass : rtic :: RacyCell < core :: mem ::
     MaybeUninit < Compass >> = rtic :: RacyCell ::
     new(core :: mem :: MaybeUninit :: uninit());
     #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
-    #[doc(hidden)] #[link_section = ".uninit.rtic21"] static
+    #[doc(hidden)] #[link_section = ".uninit.rtic25"] static
     __rtic_internal_local_resource_baro : rtic :: RacyCell < core :: mem ::
     MaybeUninit < Baro >> = rtic :: RacyCell ::
     new(core :: mem :: MaybeUninit :: uninit());
     #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
-    #[doc(hidden)] #[link_section = ".uninit.rtic22"] static
+    #[doc(hidden)] #[link_section = ".uninit.rtic26"] static
     __rtic_internal_local_resource_mtf_rx : rtic :: RacyCell < core :: mem ::
     MaybeUninit < Rx < pac :: USART2 > >> = rtic :: RacyCell ::
     new(core :: mem :: MaybeUninit :: uninit());
     #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
-    #[doc(hidden)] #[link_section = ".uninit.rtic23"] static
+    #[doc(hidden)] #[link_section = ".uninit.rtic27"] static
     __rtic_internal_local_resource_mtf_parser : rtic :: RacyCell < core :: mem
     :: MaybeUninit < MspParser >> = rtic :: RacyCell ::
     new(core :: mem :: MaybeUninit :: uninit());
     #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
-    #[doc(hidden)] #[link_section = ".uninit.rtic24"] static
+    #[doc(hidden)] #[link_section = ".uninit.rtic28"] static
     __rtic_internal_local_resource_crsf_rx : rtic :: RacyCell < core :: mem ::
     MaybeUninit < Rx < pac :: UART5 > >> = rtic :: RacyCell ::
     new(core :: mem :: MaybeUninit :: uninit());
     #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
-    #[doc(hidden)] #[link_section = ".uninit.rtic25"] static
+    #[doc(hidden)] #[link_section = ".uninit.rtic29"] static
     __rtic_internal_local_resource_crsf_parser : rtic :: RacyCell < core ::
     mem :: MaybeUninit < CrsfParser >> = rtic :: RacyCell ::
     new(core :: mem :: MaybeUninit :: uninit());
     #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
-    #[doc(hidden)] #[link_section = ".uninit.rtic26"] static
+    #[doc(hidden)] #[link_section = ".uninit.rtic30"] static
     __rtic_internal_local_resource_nav : rtic :: RacyCell < core :: mem ::
     MaybeUninit < Nav >> = rtic :: RacyCell ::
+    new(core :: mem :: MaybeUninit :: uninit());
+    #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
+    #[doc(hidden)] #[link_section = ".uninit.rtic31"] static
+    __rtic_internal_local_resource_tfl_left_rx : rtic :: RacyCell < core ::
+    mem :: MaybeUninit < Rx < pac :: USART6 > >> = rtic :: RacyCell ::
+    new(core :: mem :: MaybeUninit :: uninit());
+    #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
+    #[doc(hidden)] #[link_section = ".uninit.rtic32"] static
+    __rtic_internal_local_resource_tfl_left_parser : rtic :: RacyCell < core
+    :: mem :: MaybeUninit < TfLunaParser >> = rtic :: RacyCell ::
+    new(core :: mem :: MaybeUninit :: uninit());
+    #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
+    #[doc(hidden)] #[link_section = ".uninit.rtic33"] static
+    __rtic_internal_local_resource_tfl_right_rx : rtic :: RacyCell < core ::
+    mem :: MaybeUninit < Rx < pac :: UART7 > >> = rtic :: RacyCell ::
+    new(core :: mem :: MaybeUninit :: uninit());
+    #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
+    #[doc(hidden)] #[link_section = ".uninit.rtic34"] static
+    __rtic_internal_local_resource_tfl_right_parser : rtic :: RacyCell < core
+    :: mem :: MaybeUninit < TfLunaParser >> = rtic :: RacyCell ::
+    new(core :: mem :: MaybeUninit :: uninit());
+    #[allow(non_camel_case_types)] #[allow(non_upper_case_globals)]
+    #[doc(hidden)] #[link_section = ".uninit.rtic35"] static
+    __rtic_internal_local_resource_ekf : rtic :: RacyCell < core :: mem ::
+    MaybeUninit < Ekf >> = rtic :: RacyCell ::
     new(core :: mem :: MaybeUninit :: uninit());
     #[allow(non_upper_case_globals)] static __rtic_internal_imu1_task_EXEC :
     rtic :: export :: executor :: AsyncTaskExecutorPtr = rtic :: export ::
@@ -1651,6 +2203,9 @@
     __rtic_internal_nav_task_EXEC : rtic :: export :: executor ::
     AsyncTaskExecutorPtr = rtic :: export :: executor :: AsyncTaskExecutorPtr
     :: new(); #[allow(non_upper_case_globals)] static
+    __rtic_internal_ekf_task_EXEC : rtic :: export :: executor ::
+    AsyncTaskExecutorPtr = rtic :: export :: executor :: AsyncTaskExecutorPtr
+    :: new(); #[allow(non_upper_case_globals)] static
     __rtic_internal_usb_task_EXEC : rtic :: export :: executor ::
     AsyncTaskExecutorPtr = rtic :: export :: executor :: AsyncTaskExecutorPtr
     :: new(); #[allow(non_snake_case)]
@@ -1662,6 +2217,14 @@
         run(PRIORITY, ||
         {
             let exec = rtic :: export :: executor :: AsyncTaskExecutor ::
+            from_ptr_1_args(ekf_task, & __rtic_internal_ekf_task_EXEC);
+            exec.poll(||
+            {
+                let exec = rtic :: export :: executor :: AsyncTaskExecutor ::
+                from_ptr_1_args(ekf_task, & __rtic_internal_ekf_task_EXEC);
+                exec.set_pending(); rtic :: export ::
+                pend(stm32h7xx_hal :: pac :: interrupt :: LPTIM1);
+            }); let exec = rtic :: export :: executor :: AsyncTaskExecutor ::
             from_ptr_1_args(i2c_task, & __rtic_internal_i2c_task_EXEC);
             exec.poll(||
             {
@@ -1741,9 +2304,11 @@
         export :: assert_send :: < BaroData > (); rtic :: export ::
         assert_send :: < Mtf01Data > (); rtic :: export :: assert_send :: <
         RcChannels > (); rtic :: export :: assert_send :: < NavState > ();
-        rtic :: export :: assert_send :: < Baro > (); rtic :: export ::
-        interrupt :: disable(); let mut core : rtic :: export :: Peripherals =
-        rtic :: export :: Peripherals :: steal().into(); let _ =
+        rtic :: export :: assert_send :: < TfLunaData > (); rtic :: export ::
+        assert_send :: < [f32; 3] > (); rtic :: export :: assert_send :: <
+        NavSolution > (); rtic :: export :: assert_send :: < Baro > (); rtic
+        :: export :: interrupt :: disable(); let mut core : rtic :: export ::
+        Peripherals = rtic :: export :: Peripherals :: steal().into(); let _ =
         you_must_enable_the_rt_feature_for_the_pac_in_your_cargo_toml ::
         interrupt :: LPTIM1; let _ =
         you_must_enable_the_rt_feature_for_the_pac_in_your_cargo_toml ::
@@ -1815,7 +2380,29 @@
         cortex_logical2hw(4u8, stm32h7xx_hal :: pac :: NVIC_PRIO_BITS),); rtic
         :: export :: NVIC ::
         unmask(you_must_enable_the_rt_feature_for_the_pac_in_your_cargo_toml
-        :: interrupt :: UART5); #[inline(never)] fn __rtic_init_resources < F
+        :: interrupt :: UART5); const _ : () = if
+        (1 << stm32h7xx_hal :: pac :: NVIC_PRIO_BITS) < 4u8 as usize
+        {
+            :: core :: panic!
+            ("Maximum priority used by interrupt vector 'USART6' is more than supported by hardware");
+        };
+        core.NVIC.set_priority(you_must_enable_the_rt_feature_for_the_pac_in_your_cargo_toml
+        :: interrupt :: USART6, rtic :: export ::
+        cortex_logical2hw(4u8, stm32h7xx_hal :: pac :: NVIC_PRIO_BITS),); rtic
+        :: export :: NVIC ::
+        unmask(you_must_enable_the_rt_feature_for_the_pac_in_your_cargo_toml
+        :: interrupt :: USART6); const _ : () = if
+        (1 << stm32h7xx_hal :: pac :: NVIC_PRIO_BITS) < 4u8 as usize
+        {
+            :: core :: panic!
+            ("Maximum priority used by interrupt vector 'UART7' is more than supported by hardware");
+        };
+        core.NVIC.set_priority(you_must_enable_the_rt_feature_for_the_pac_in_your_cargo_toml
+        :: interrupt :: UART7, rtic :: export ::
+        cortex_logical2hw(4u8, stm32h7xx_hal :: pac :: NVIC_PRIO_BITS),); rtic
+        :: export :: NVIC ::
+        unmask(you_must_enable_the_rt_feature_for_the_pac_in_your_cargo_toml
+        :: interrupt :: UART7); #[inline(never)] fn __rtic_init_resources < F
         > (f : F) where F : FnOnce() { f(); } let mut executors_size = 0; let
         executor = :: core :: mem :: ManuallyDrop ::
         new(rtic :: export :: executor :: AsyncTaskExecutor ::
@@ -1842,6 +2429,11 @@
         new_1_args(nav_task)); executors_size += :: core :: mem ::
         size_of_val(& executor);
         __rtic_internal_nav_task_EXEC.set_in_main(& executor); let executor =
+        :: core :: mem :: ManuallyDrop ::
+        new(rtic :: export :: executor :: AsyncTaskExecutor ::
+        new_1_args(ekf_task)); executors_size += :: core :: mem ::
+        size_of_val(& executor);
+        __rtic_internal_ekf_task_EXEC.set_in_main(& executor); let executor =
         :: core :: mem :: ManuallyDrop ::
         new(rtic :: export :: executor :: AsyncTaskExecutor ::
         new_1_args(usb_task)); executors_size += :: core :: mem ::
@@ -1876,6 +2468,14 @@
             MaybeUninit :: new(shared_resources.rc));
             __rtic_internal_shared_resource_navs.get_mut().write(core :: mem
             :: MaybeUninit :: new(shared_resources.navs));
+            __rtic_internal_shared_resource_prox_left.get_mut().write(core ::
+            mem :: MaybeUninit :: new(shared_resources.prox_left));
+            __rtic_internal_shared_resource_prox_right.get_mut().write(core ::
+            mem :: MaybeUninit :: new(shared_resources.prox_right));
+            __rtic_internal_shared_resource_accel_w.get_mut().write(core ::
+            mem :: MaybeUninit :: new(shared_resources.accel_w));
+            __rtic_internal_shared_resource_navsol.get_mut().write(core :: mem
+            :: MaybeUninit :: new(shared_resources.navsol));
             __rtic_internal_local_resource_imu1.get_mut().write(core :: mem ::
             MaybeUninit :: new(local_resources.imu1));
             __rtic_internal_local_resource_lpf1.get_mut().write(core :: mem ::
@@ -1911,7 +2511,17 @@
             __rtic_internal_local_resource_crsf_parser.get_mut().write(core ::
             mem :: MaybeUninit :: new(local_resources.crsf_parser));
             __rtic_internal_local_resource_nav.get_mut().write(core :: mem ::
-            MaybeUninit :: new(local_resources.nav)); rtic :: export ::
+            MaybeUninit :: new(local_resources.nav));
+            __rtic_internal_local_resource_tfl_left_rx.get_mut().write(core ::
+            mem :: MaybeUninit :: new(local_resources.tfl_left_rx));
+            __rtic_internal_local_resource_tfl_left_parser.get_mut().write(core
+            :: mem :: MaybeUninit :: new(local_resources.tfl_left_parser));
+            __rtic_internal_local_resource_tfl_right_rx.get_mut().write(core
+            :: mem :: MaybeUninit :: new(local_resources.tfl_right_rx));
+            __rtic_internal_local_resource_tfl_right_parser.get_mut().write(core
+            :: mem :: MaybeUninit :: new(local_resources.tfl_right_parser));
+            __rtic_internal_local_resource_ekf.get_mut().write(core :: mem ::
+            MaybeUninit :: new(local_resources.ekf)); rtic :: export ::
             interrupt :: enable();
         }); loop {}
     }

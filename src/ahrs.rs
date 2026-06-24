@@ -238,3 +238,28 @@ fn inv_sqrt(x: f32) -> f32 {
         0.0
     }
 }
+
+/// Rotate a body-frame vector into the world frame using attitude quaternion
+/// `q = [w, x, y, z]` (the AHRS convention: world Z is *up*, gravity reads
+/// `+1 g` on body Z when level). `world = R(q) · body`.
+///
+/// Used by the navigation EKF to turn body-frame accelerometer readings into a
+/// world-frame acceleration for the strapdown prediction step.
+pub fn rotate_body_to_world(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
+    let [w, x, y, z] = q;
+    // Rotation matrix R (body -> world).
+    let r00 = 1.0 - 2.0 * (y * y + z * z);
+    let r01 = 2.0 * (x * y - w * z);
+    let r02 = 2.0 * (x * z + w * y);
+    let r10 = 2.0 * (x * y + w * z);
+    let r11 = 1.0 - 2.0 * (x * x + z * z);
+    let r12 = 2.0 * (y * z - w * x);
+    let r20 = 2.0 * (x * z - w * y);
+    let r21 = 2.0 * (y * z + w * x);
+    let r22 = 1.0 - 2.0 * (x * x + y * y);
+    [
+        r00 * v[0] + r01 * v[1] + r02 * v[2],
+        r10 * v[0] + r11 * v[1] + r12 * v[2],
+        r20 * v[0] + r21 * v[1] + r22 * v[2],
+    ]
+}

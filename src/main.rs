@@ -25,6 +25,7 @@ mod ahrs;
 mod baro;
 mod compass;
 mod crsf;
+mod ekf;
 mod estimator;
 mod filters;
 mod gps;
@@ -32,6 +33,7 @@ mod imu;
 mod mavlink;
 mod mtf01;
 mod nav;
+mod tfluna;
 
 use panic_halt as _;
 
@@ -59,8 +61,9 @@ mod app {
 
     use crate::ahrs::Attitude;
     use crate::baro::{Baro, BaroData};
-    use crate::compass::{Compass, MagData};
+    use crate::compass::{Compass, MagCal, MagData, MagRotation};
     use crate::crsf::{CrsfParser, RcChannels};
+    use crate::ekf::{Ekf, NavSolution};
     use crate::estimator::{Estimator, Rotation};
     use crate::filters::ImuLpf;
     use crate::gps::{GpsData, NmeaParser};
@@ -68,6 +71,7 @@ mod app {
     use crate::mavlink::{Encoder, MAV_SYS_STATUS_SENSOR_3D_ACCEL, MAV_SYS_STATUS_SENSOR_3D_GYRO};
     use crate::mtf01::{Mtf01Data, MspParser};
     use crate::nav::{Nav, NavState};
+    use crate::tfluna::{TfLunaData, TfLunaParser};
 
     // ---- Fusion tuning ----------------------------------------------------
     /// Tasks tick at 1 kHz (Systick monotonic), so the filter sample rate and
@@ -75,6 +79,20 @@ mod app {
     const SAMPLE_HZ: f32 = 1000.0;
     const DT: f32 = 1.0 / SAMPLE_HZ;
     const DEG2RAD: f32 = core::f32::consts::PI / 180.0;
+
+    // ---- Compass calibration (set on hardware; see docs/compass-cal.md) ----
+    /// Magnetic declination at your location, degrees east-positive. 0 leaves the
+    /// heading magnetic (EKF horizontal will be rotated by the local declination).
+    const MAG_DECLINATION_DEG: f32 = 0.0;
+    /// Compass mount orientation relative to the FC.
+    const MAG_ROTATION: MagRotation = MagRotation::None;
+    /// Hard-iron offset (Gauss) and soft-iron scale — from a bench calibration or
+    /// the in-field RC-triggered collector. Identity until measured.
+    const MAG_OFFSET: [f32; 3] = [0.0; 3];
+    const MAG_SCALE: [f32; 3] = [1.0; 3];
+    /// RC channel (0-based) whose high position triggers in-field compass
+    /// calibration: flip high, fly figure-8s, flip low to store. AUX by default.
+    const CAL_RC_CHANNEL: usize = 6;
     const GYRO_CUTOFF_HZ: f32 = 80.0; // gyro low-pass corner
     const ACCEL_CUTOFF_HZ: f32 = 20.0; // accel low-pass corner (gravity is ~DC)
     const AHRS_KP: f32 = 1.0; // accel->attitude correction gain
@@ -88,6 +106,8 @@ mod app {
     const MTF01_BAUD: u32 = 115_200;
     /// ExpressLRS / CRSF baud (UART5). ELRS uses 420 kbaud.
     const CRSF_BAUD: u32 = 420_000;
+    /// TF-Luna side-lidar baud (USART6 / UART7). Default is 115200.
+    const TFLUNA_BAUD: u32 = 115_200;
 
     // ---- Concrete types for the two IMU instances -------------------------
     type Imu1 = Imu<spi::Spi<pac::SPI1, spi::Enabled>, Pin<'A', 4, Output>>;
@@ -119,6 +139,14 @@ mod app {
         rc: RcChannels,
         /// Flow/lidar navigation estimate, published by the nav task.
         navs: NavState,
+        /// Side obstacle lidars, published by the USART6 / UART7 interrupts.
+        prox_left: TfLunaData,
+        prox_right: TfLunaData,
+        /// World-frame (N/E/Up) gravity-removed acceleration, published by the
+        /// estimator for the EKF prediction step.
+        accel_w: [f32; 3],
+        /// Fused navigation solution, published by the EKF task.
+        navsol: NavSolution,
     }
 
     #[local]
@@ -148,6 +176,13 @@ mod app {
         crsf_parser: CrsfParser,
         // Flow/lidar dead-reckoning integrator.
         nav: Nav,
+        // Side obstacle lidars (TF-Luna) + their decoders.
+        tfl_left_rx: Rx<pac::USART6>,
+        tfl_left_parser: TfLunaParser,
+        tfl_right_rx: Rx<pac::UART7>,
+        tfl_right_parser: TfLunaParser,
+        // Navigation EKF (position + velocity).
+        ekf: Ekf,
     }
 
     #[init]
@@ -182,6 +217,7 @@ mod app {
         // --- GPIO ----------------------------------------------------------
         let gpioa = dp.GPIOA.split(ccdr.peripheral.GPIOA);
         let gpiob = dp.GPIOB.split(ccdr.peripheral.GPIOB);
+        let gpioc = dp.GPIOC.split(ccdr.peripheral.GPIOC);
         let gpiod = dp.GPIOD.split(ccdr.peripheral.GPIOD);
         let gpioe = dp.GPIOE.split(ccdr.peripheral.GPIOE);
 
@@ -289,6 +325,38 @@ mod app {
         let (_crsf_tx, mut crsf_rx) = serial5.split();
         crsf_rx.listen();
 
+        // --- USART6 -> TF-Luna LEFT side lidar  (PC6 TX / PC7 RX) ----------
+        let serial6 = dp
+            .USART6
+            .serial(
+                (
+                    gpioc.pc6.into_alternate::<7>(),
+                    gpioc.pc7.into_alternate::<7>(),
+                ),
+                TFLUNA_BAUD.bps(),
+                ccdr.peripheral.USART6,
+                &ccdr.clocks,
+            )
+            .unwrap();
+        let (_tfl_l_tx, mut tfl_left_rx) = serial6.split();
+        tfl_left_rx.listen();
+
+        // --- UART7 -> TF-Luna RIGHT side lidar  (PE7 RX / PE8 TX) ----------
+        let serial7 = dp
+            .UART7
+            .serial(
+                (
+                    gpioe.pe8.into_alternate::<7>(),
+                    gpioe.pe7.into_alternate::<7>(),
+                ),
+                TFLUNA_BAUD.bps(),
+                ccdr.peripheral.UART7,
+                &ccdr.clocks,
+            )
+            .unwrap();
+        let (_tfl_r_tx, mut tfl_right_rx) = serial7.split();
+        tfl_right_rx.listen();
+
         // --- USB CDC-ACM  (OTG2_FS internal full-speed PHY, PA11/PA12) ------
         let usb = USB2::new(
             dp.OTG2_HS_GLOBAL,
@@ -323,7 +391,9 @@ mod app {
         // --- Build the fusion pipeline -------------------------------------
         let lpf1 = ImuLpf::new(SAMPLE_HZ, GYRO_CUTOFF_HZ, ACCEL_CUTOFF_HZ);
         let lpf2 = ImuLpf::new(SAMPLE_HZ, GYRO_CUTOFF_HZ, ACCEL_CUTOFF_HZ);
-        let est = Estimator::new(AHRS_KP, AHRS_KI, Rotation::Roll180, Rotation::Pitch180);
+        let mut est = Estimator::new(AHRS_KP, AHRS_KI, Rotation::Roll180, Rotation::Pitch180);
+        est.set_declination(MAG_DECLINATION_DEG);
+        est.set_mag_cal(MagCal::new(MAG_ROTATION, MAG_OFFSET, MAG_SCALE));
 
         // --- Kick off the periodic tasks -----------------------------------
         imu1_task::spawn().ok();
@@ -331,6 +401,7 @@ mod app {
         estimator_task::spawn().ok();
         i2c_task::spawn().ok();
         nav_task::spawn().ok();
+        ekf_task::spawn().ok();
         usb_task::spawn().ok();
 
         (
@@ -350,6 +421,10 @@ mod app {
                 flow: Mtf01Data::default(),
                 rc: RcChannels::default(),
                 navs: NavState::default(),
+                prox_left: TfLunaData::default(),
+                prox_right: TfLunaData::default(),
+                accel_w: [0.0; 3],
+                navsol: NavSolution::default(),
             },
             Local {
                 imu1,
@@ -370,6 +445,11 @@ mod app {
                 crsf_rx,
                 crsf_parser: CrsfParser::new(),
                 nav: Nav::new(),
+                tfl_left_rx,
+                tfl_left_parser: TfLunaParser::new(),
+                tfl_right_rx,
+                tfl_right_parser: TfLunaParser::new(),
+                ekf: Ekf::new(),
             },
         )
     }
@@ -424,7 +504,7 @@ mod app {
 
     /// Sensor fusion — 1 kHz. Combines both filtered IMUs and runs the Mahony
     /// attitude filter. Priority 2: above USB, below raw sampling.
-    #[task(priority = 2, local = [est], shared = [out1, out2, att, mag])]
+    #[task(priority = 2, local = [est], shared = [out1, out2, att, mag, accel_w, rc])]
     async fn estimator_task(cx: estimator_task::Context) {
         let est = cx.local.est;
         let estimator_task::SharedResources {
@@ -432,16 +512,35 @@ mod app {
             mut out2,
             mut att,
             mut mag,
+            mut accel_w,
+            mut rc,
             ..
         } = cx.shared;
 
+        let mut cal_active = false;
         loop {
+            // In-field compass calibration via an RC AUX switch: high starts the
+            // hard-iron collector, low stores it. Centre (~1500) does nothing, so
+            // a lost link can't trigger it.
+            let ch = rc.lock(|r| r.ch_us(CAL_RC_CHANNEL));
+            if ch > 1700 && !cal_active {
+                est.mag_cal_mut().start_collection();
+                cal_active = true;
+            } else if ch < 1300 && cal_active {
+                est.mag_cal_mut().finish_collection();
+                cal_active = false;
+            }
+
             let o1 = out1.lock(|o| *o);
             let o2 = out2.lock(|o| *o);
             let m = mag.lock(|m| *m);
             let mag_field = m.healthy.then_some(m.field);
             let a = est.update(&o1, &o2, mag_field, DT);
+
+            // The estimator publishes the world-frame, gravity-removed, true-north
+            // acceleration directly — the EKF's strapdown prediction input.
             att.lock(|x| *x = a);
+            accel_w.lock(|x| *x = est.accel_world());
             Mono::delay(1.millis()).await;
         }
     }
@@ -501,6 +600,38 @@ mod app {
         }
     }
 
+    /// USART6 RX interrupt — TF-Luna LEFT obstacle lidar.
+    #[task(binds = USART6, priority = 4, local = [tfl_left_rx, tfl_left_parser], shared = [prox_left])]
+    fn usart6_rx(mut cx: usart6_rx::Context) {
+        let parser = cx.local.tfl_left_parser;
+        let mut updated = false;
+        while let Ok(byte) = cx.local.tfl_left_rx.read() {
+            if parser.push(byte) {
+                updated = true;
+            }
+        }
+        if updated {
+            let data = parser.data();
+            cx.shared.prox_left.lock(|p| *p = data);
+        }
+    }
+
+    /// UART7 RX interrupt — TF-Luna RIGHT obstacle lidar.
+    #[task(binds = UART7, priority = 4, local = [tfl_right_rx, tfl_right_parser], shared = [prox_right])]
+    fn uart7_rx(mut cx: uart7_rx::Context) {
+        let parser = cx.local.tfl_right_parser;
+        let mut updated = false;
+        while let Ok(byte) = cx.local.tfl_right_rx.read() {
+            if parser.push(byte) {
+                updated = true;
+            }
+        }
+        if updated {
+            let data = parser.data();
+            cx.shared.prox_right.lock(|p| *p = data);
+        }
+    }
+
     /// I2C2 sensor poll — magnetometer + SPL06 barometer share the bus, so one
     /// task owns it. Compass every loop (~100 Hz for the AHRS); baro every 5th
     /// loop (~20 Hz, well above its 8 Hz conversion rate). Priority 1; each
@@ -550,10 +681,78 @@ mod app {
         }
     }
 
+    /// Navigation EKF — 100 Hz position/velocity estimator. Predicts on the
+    /// world-frame acceleration from the estimator, then fuses GPS (horizontal
+    /// position + velocity), barometer + lidar (vertical), and optical flow
+    /// (horizontal velocity). See [`crate::ekf`] and `docs/ekf.md`. Priority 1.
+    #[task(priority = 1, local = [ekf], shared = [accel_w, gps, baro, navs, navsol])]
+    async fn ekf_task(cx: ekf_task::Context) {
+        let ekf = cx.local.ekf;
+        let ekf_task::SharedResources {
+            mut accel_w,
+            mut gps,
+            mut baro,
+            mut navs,
+            mut navsol,
+            ..
+        } = cx.shared;
+
+        const EKF_DT: f32 = 0.01; // 100 Hz
+        let mut last_gps_seq: u32 = 0;
+        let mut tick: u32 = 0;
+        loop {
+            // --- Predict on the strapdown world acceleration. ---
+            let aw = accel_w.lock(|x| *x);
+            ekf.predict(aw, EKF_DT);
+
+            // --- GPS: fuse only on a fresh 3D fix. ---
+            let g = gps.lock(|g| *g);
+            if g.fix_type >= 3 && g.sentences != last_gps_seq {
+                last_gps_seq = g.sentences;
+                let lat = g.lat_e7 as f32 * 1.0e-7;
+                let lon = g.lon_e7 as f32 * 1.0e-7;
+                let alt = g.alt_mm as f32 * 1.0e-3;
+                if !ekf.origin_set() {
+                    ekf.set_origin(lat, lon, alt);
+                }
+                let (n, e) = ekf.gps_to_local(lat, lon);
+                ekf.fuse_gps_pos(n, e, g.eph as f32 / 100.0);
+                if g.cog_cdeg != u16::MAX && g.vel_cms > 0 {
+                    let cog = (g.cog_cdeg as f32 / 100.0) * DEG2RAD;
+                    let v = g.vel_cms as f32 / 100.0;
+                    ekf.fuse_gps_vel(v * libm::cosf(cog), v * libm::sinf(cog));
+                }
+            }
+
+            // --- Barometer (~10 Hz): primary vertical, launch-referenced. ---
+            if tick % 10 == 0 {
+                let b = baro.lock(|b| *b);
+                if b.healthy {
+                    ekf.fuse_baro(b.rel_altitude_m);
+                }
+            }
+
+            // --- Lidar height + optical-flow velocity (~20 Hz). ---
+            if tick % 5 == 0 {
+                let nv = navs.lock(|n| *n);
+                if nv.height_valid {
+                    ekf.fuse_lidar(nv.height_m);
+                    if nv.flow_quality >= 30 {
+                        ekf.fuse_flow_vel(nv.vx, nv.vy, nv.flow_quality as f32 / 255.0);
+                    }
+                }
+            }
+
+            navsol.lock(|x| *x = ekf.solution());
+            tick = tick.wrapping_add(1);
+            Mono::delay(10.millis()).await;
+        }
+    }
+
     /// Owns the whole USB stack: polls it at ~1 kHz (keeps enumeration alive and
     /// flushes the IN endpoint) and streams MAVLink 2 telemetry. Lowest
     /// priority, so it can never delay the IMU sampling tasks.
-    #[task(priority = 1, local = [usb_dev, serial, mavlink], shared = [out1, out2, gps, mag, att, flow, rc, navs, baro])]
+    #[task(priority = 1, local = [usb_dev, serial, mavlink], shared = [out1, out2, gps, mag, att, flow, rc, navs, baro, prox_left, prox_right, navsol])]
     async fn usb_task(cx: usb_task::Context) {
         let usb_dev = cx.local.usb_dev;
         let serial = cx.local.serial;
@@ -568,6 +767,9 @@ mod app {
             mut rc,
             mut navs,
             mut baro,
+            mut prox_left,
+            mut prox_right,
+            mut navsol,
             ..
         } = cx.shared;
 
@@ -654,6 +856,7 @@ mod app {
             }
             if tick % 200 == 60 {
                 let g = gps.lock(|g| *g);
+                let sol = navsol.lock(|s| *s);
                 let yaw_deg = att.lock(|x| x.yaw);
                 // Heading 0..360 deg -> centidegrees.
                 let hdg = {
@@ -666,43 +869,75 @@ mod app {
                     }
                     (h * 100.0) as u16
                 };
-                // Ground velocity NED from GPS speed + course.
-                let (vx, vy) = if g.cog_cdeg != u16::MAX {
-                    let cog = (g.cog_cdeg as f32 / 100.0) * DEG2RAD;
-                    let v = g.vel_cms as f32;
-                    ((v * libm::cosf(cog)) as i16, (v * libm::sinf(cog)) as i16)
+
+                // Prefer the fused EKF solution once converged; fall back to raw
+                // GPS otherwise so the link still shows something pre-fix.
+                let (lat_e7, lon_e7, alt_mm, rel_alt_mm, vx, vy, vz) = if sol.converged {
+                    (
+                        sol.lat_e7,
+                        sol.lon_e7,
+                        sol.alt_mm,
+                        sol.rel_alt_mm,
+                        (sol.vel[0] * 100.0) as i16, // north cm/s
+                        (sol.vel[1] * 100.0) as i16, // east cm/s
+                        (-sol.vel[2] * 100.0) as i16, // up -> down cm/s
+                    )
                 } else {
-                    (0, 0)
-                };
-                // Above-ground height from the lidar (mm) when valid, else 0.
-                let n = navs.lock(|n| *n);
-                let rel_alt = if n.height_valid {
-                    (n.height_m * 1000.0) as i32
-                } else {
-                    0
+                    let (vx, vy) = if g.cog_cdeg != u16::MAX {
+                        let cog = (g.cog_cdeg as f32 / 100.0) * DEG2RAD;
+                        let v = g.vel_cms as f32;
+                        ((v * libm::cosf(cog)) as i16, (v * libm::sinf(cog)) as i16)
+                    } else {
+                        (0, 0)
+                    };
+                    (g.lat_e7, g.lon_e7, g.alt_mm, 0, vx, vy, 0)
                 };
                 let frame = mavlink.global_position_int(
-                    tick,
-                    g.lat_e7,
-                    g.lon_e7,
-                    g.alt_mm,
-                    rel_alt,
-                    vx,
-                    vy,
-                    0,
-                    hdg,
+                    tick, lat_e7, lon_e7, alt_mm, rel_alt_mm, vx, vy, vz, hdg,
                 );
                 pump_write(usb_dev, serial, frame.as_slice());
             }
 
-            // Lidar height as DISTANCE_SENSOR at 10 Hz.
+            // Fused local position/velocity (NED) at 10 Hz.
+            if tick % 100 == 50 {
+                let sol = navsol.lock(|s| *s);
+                if sol.converged {
+                    // World frame is N/E/Up; LOCAL_POSITION_NED is N/E/Down.
+                    let frame = mavlink.local_position_ned(
+                        tick,
+                        sol.pos[0],
+                        sol.pos[1],
+                        -sol.pos[2],
+                        sol.vel[0],
+                        sol.vel[1],
+                        -sol.vel[2],
+                    );
+                    pump_write(usb_dev, serial, frame.as_slice());
+                }
+            }
+
+            // Downward lidar height as DISTANCE_SENSOR (orientation 25, id 0).
             if tick % 100 == 70 {
                 let f = flow.lock(|f| *f);
                 if f.dist_valid {
                     let cm = (f.dist_mm / 10).clamp(0, u16::MAX as i32) as u16;
-                    let frame = mavlink.distance_sensor(tick, 2, 800, cm);
+                    let frame = mavlink.distance_sensor(tick, 2, 800, cm, 25, 0);
                     pump_write(usb_dev, serial, frame.as_slice());
                 }
+            }
+
+            // Side obstacle lidars at 15 Hz: left = orientation 6 / id 1,
+            // right = orientation 2 / id 2. Always sent (even when out of range)
+            // so the ground station can show "clear" vs. "near".
+            if tick % 66 == 33 {
+                let l = prox_left.lock(|p| *p);
+                let r = prox_right.lock(|p| *p);
+                let lcm = if l.valid { l.distance_cm } else { tfluna::MAX_CM };
+                let rcm = if r.valid { r.distance_cm } else { tfluna::MAX_CM };
+                let fl = mavlink.distance_sensor(tick, tfluna::MIN_CM, tfluna::MAX_CM, lcm, 6, 1);
+                pump_write(usb_dev, serial, fl.as_slice());
+                let fr = mavlink.distance_sensor(tick, tfluna::MIN_CM, tfluna::MAX_CM, rcm, 2, 2);
+                pump_write(usb_dev, serial, fr.as_slice());
             }
 
             // Optical flow at 20 Hz.

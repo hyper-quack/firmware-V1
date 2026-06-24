@@ -64,6 +64,128 @@ pub struct MagData {
     pub healthy: bool,
 }
 
+/// Compass mounting orientation, board-relative. A compass on a GPS mast is
+/// frequently rotated in yaw (or flipped) relative to the flight controller.
+#[derive(Clone, Copy)]
+pub enum MagRotation {
+    None,
+    Yaw90,
+    Yaw180,
+    Yaw270,
+    /// Mounted upside-down.
+    Roll180,
+}
+
+impl MagRotation {
+    /// Rotate a field vector into the body frame.
+    fn apply(self, v: [f32; 3]) -> [f32; 3] {
+        match self {
+            MagRotation::None => v,
+            MagRotation::Yaw90 => [-v[1], v[0], v[2]],
+            MagRotation::Yaw180 => [-v[0], -v[1], v[2]],
+            MagRotation::Yaw270 => [v[1], -v[0], v[2]],
+            MagRotation::Roll180 => [v[0], -v[1], -v[2]],
+        }
+    }
+}
+
+/// Compass calibration: mounting rotation + hard-iron offset + soft-iron scale,
+/// with an optional online min/max collector that estimates the hard-iron offset.
+///
+/// Correction order (the physical one): the iron distortion is fixed in the
+/// **sensor** frame, so offset/scale are applied to the raw reading *first*, then
+/// the mounting rotation maps it into the body frame.
+///
+/// ```text
+///   corrected_body = rotation · ( scale ⊙ (raw − offset) )
+/// ```
+#[derive(Clone, Copy)]
+pub struct MagCal {
+    pub rotation: MagRotation,
+    /// Hard-iron offset (Gauss), subtracted from the raw field.
+    pub offset: [f32; 3],
+    /// Soft-iron diagonal scale, multiplied after offset removal.
+    pub scale: [f32; 3],
+    // --- online hard-iron collection ---
+    collecting: bool,
+    min: [f32; 3],
+    max: [f32; 3],
+}
+
+impl MagCal {
+    /// Identity calibration (no rotation, no offset, unit scale). Replace the
+    /// fields with bench-measured values, or run the online collector.
+    pub const fn identity() -> Self {
+        Self {
+            rotation: MagRotation::None,
+            offset: [0.0; 3],
+            scale: [1.0; 3],
+            collecting: false,
+            min: [0.0; 3],
+            max: [0.0; 3],
+        }
+    }
+
+    pub const fn new(rotation: MagRotation, offset: [f32; 3], scale: [f32; 3]) -> Self {
+        Self {
+            rotation,
+            offset,
+            scale,
+            collecting: false,
+            min: [0.0; 3],
+            max: [0.0; 3],
+        }
+    }
+
+    /// Apply the full correction to a raw field (Gauss), returning a body-frame
+    /// vector. Also feeds the online collector when active.
+    pub fn apply(&mut self, raw: [f32; 3]) -> [f32; 3] {
+        if self.collecting {
+            for i in 0..3 {
+                if raw[i] < self.min[i] {
+                    self.min[i] = raw[i];
+                }
+                if raw[i] > self.max[i] {
+                    self.max[i] = raw[i];
+                }
+            }
+        }
+        let c = [
+            (raw[0] - self.offset[0]) * self.scale[0],
+            (raw[1] - self.offset[1]) * self.scale[1],
+            (raw[2] - self.offset[2]) * self.scale[2],
+        ];
+        self.rotation.apply(c)
+    }
+
+    /// Begin online hard-iron collection. Rotate the vehicle through all
+    /// orientations (figure-8s) while this runs, then call [`finish_collection`].
+    pub fn start_collection(&mut self) {
+        self.collecting = true;
+        self.min = [f32::MAX; 3];
+        self.max = [f32::MIN; 3];
+    }
+
+    /// Finish collection: hard-iron offset = midpoint of each axis range,
+    /// soft-iron scale = equalise each axis's range to the average range. No-op if
+    /// too little data was gathered.
+    pub fn finish_collection(&mut self) {
+        self.collecting = false;
+        let mut range = [0.0f32; 3];
+        for i in 0..3 {
+            range[i] = (self.max[i] - self.min[i]) * 0.5;
+        }
+        if range[0] <= 0.0 || range[1] <= 0.0 || range[2] <= 0.0 {
+            return; // not enough motion
+        }
+        let avg = (range[0] + range[1] + range[2]) / 3.0;
+        for i in 0..3 {
+            self.offset[i] = (self.max[i] + self.min[i]) * 0.5;
+            self.scale[i] = avg / range[i];
+        }
+    }
+}
+
 /// Magnetometer state. The I2C bus is passed in per call (shared bus).
 #[derive(Default)]
 pub struct Compass {

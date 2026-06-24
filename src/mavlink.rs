@@ -23,6 +23,8 @@ const MSG_SCALED_PRESSURE: u32 = 29;
 const CRC_SCALED_PRESSURE: u8 = 115;
 const MSG_ATTITUDE: u32 = 30;
 const CRC_ATTITUDE: u8 = 39;
+const MSG_LOCAL_POSITION_NED: u32 = 32;
+const CRC_LOCAL_POSITION_NED: u8 = 185;
 const MSG_GLOBAL_POSITION_INT: u32 = 33;
 const CRC_GLOBAL_POSITION_INT: u8 = 104;
 const MSG_RC_CHANNELS: u32 = 65;
@@ -164,6 +166,30 @@ impl Encoder {
         self.frame(MSG_ATTITUDE, CRC_ATTITUDE, p.as_slice())
     }
 
+    /// LOCAL_POSITION_NED (message 32): fused position/velocity in the local
+    /// tangent frame, metres and m/s, **NED** (z down, vz down-positive).
+    #[allow(clippy::too_many_arguments)]
+    pub fn local_position_ned(
+        &mut self,
+        time_boot_ms: u32,
+        x: f32,
+        y: f32,
+        z: f32,
+        vx: f32,
+        vy: f32,
+        vz: f32,
+    ) -> Frame {
+        let mut p = Payload::new();
+        p.u32(time_boot_ms);
+        p.f32(x);
+        p.f32(y);
+        p.f32(z);
+        p.f32(vx);
+        p.f32(vy);
+        p.f32(vz);
+        self.frame(MSG_LOCAL_POSITION_NED, CRC_LOCAL_POSITION_NED, p.as_slice())
+    }
+
     /// Standard GLOBAL_POSITION_INT (message 33): fused/global position. lat/lon
     /// in 1e7-deg, altitudes in mm, velocities in cm/s, heading in centidegrees
     /// (65535 = unknown).
@@ -241,14 +267,18 @@ impl Encoder {
         self.frame(MSG_SCKY_IMU_STATUS, CRC_SCKY_IMU_STATUS, p.as_slice())
     }
 
-    /// DISTANCE_SENSOR (message 132): downward lidar height. Distances in cm.
-    /// `orientation` 25 = MAV_SENSOR_ROTATION_PITCH_270 (facing straight down).
+    /// DISTANCE_SENSOR (message 132). Distances in cm. `orientation` is a
+    /// MAV_SENSOR_ORIENTATION (25 = down, 0 = forward, 2 = right, 6 = left);
+    /// `id` distinguishes multiple rangefinders.
+    #[allow(clippy::too_many_arguments)]
     pub fn distance_sensor(
         &mut self,
         time_boot_ms: u32,
         min_cm: u16,
         max_cm: u16,
         current_cm: u16,
+        orientation: u8,
+        id: u8,
     ) -> Frame {
         let mut p = Payload::new();
         p.u32(time_boot_ms);
@@ -256,8 +286,8 @@ impl Encoder {
         p.u16(max_cm);
         p.u16(current_cm);
         p.u8(0); // type: 0 = laser rangefinder
-        p.u8(0); // id
-        p.u8(25); // orientation: facing down
+        p.u8(id);
+        p.u8(orientation);
         p.u8(0); // covariance unknown
         self.frame(MSG_DISTANCE_SENSOR, CRC_DISTANCE_SENSOR, p.as_slice())
     }

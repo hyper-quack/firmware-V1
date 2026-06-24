@@ -108,7 +108,9 @@ quality; the **RC · ELRS 900** card shows channel bars + link quality + failsaf
 | **MTF-01 (flow + lidar)** | **USART2** | **PD5 / PD6** | 115200 MSP | ✅ **Phase 3** |
 | **ExpressLRS 900 RX** | **UART5** | **PB5 / PB6** | 420000 CRSF | ✅ **Phase 3** |
 | Barometer (SPL06) | I2C2 | PB10/PB11 (shared) | 0x76 | ✅ (see [baro-spl06.md](baro-spl06.md)) |
+| Side lidar L (TF-Luna) | USART6 | PC6 / PC7 | 115200 | ✅ (see [proximity-tfluna.md](proximity-tfluna.md)) |
+| Side lidar R (TF-Luna) | UART7 | PE7 / PE8 | 115200 | ✅ (see [proximity-tfluna.md](proximity-tfluna.md)) |
 | OSD | SPI2 | PB13/14/15 | CS PB12 | — not planned |
 | Dataflash | SPI3 | PC10/11/12 | CS PA15 | — not planned |
 
-Spare UARTs remaining: USART6 (PC6/7), UART7 (PE7/8), UART8 (PE0/1).
+Spare UART remaining: UART8 (PE0/1).

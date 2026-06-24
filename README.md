@@ -11,8 +11,9 @@ MAVLink 2 telemetry over USB — the foundation everything else builds on.
 > telemetry over USB CDC. It is
 > **not** yet a closed-loop flight controller (no control or motor output).
 >
-> The full fusion pipeline is documented in
-> **[docs/sensor-fusion.md](docs/sensor-fusion.md)**.
+> The full fusion pipeline — **start here for the whole-system map** — is in
+> **[docs/sensor-fusion.md](docs/sensor-fusion.md)**; the position/velocity
+> navigation filter is in **[docs/ekf.md](docs/ekf.md)**.
 > The platform receive schema is documented in
 > **[docs/mavlink-telemetry.md](docs/mavlink-telemetry.md)**.
 
@@ -79,12 +80,16 @@ wiring detail, and the full board placement map are in
 | Optical flow + lidar (MTF-01) | external (MSP) | USART2 (PD5 TX / PD6 RX), 115200 | [mtf01.rs](src/mtf01.rs) |
 | ExpressLRS 900 RX (CRSF) | `SERIAL5 = RCIN` (UART5) | UART5 (PB5 RX / PB6 TX), 420000 | [crsf.rs](src/crsf.rs) |
 | Barometer (SPL06) | `BARO SPL06 I2C:0:0x76` | I2C2 (PB10 SCL / PB11 SDA), 0x76 | [baro.rs](src/baro.rs) |
+| Side lidar L (TF-Luna) | external | USART6 (PC6 TX / PC7 RX), 115200 | [tfluna.rs](src/tfluna.rs) |
+| Side lidar R (TF-Luna) | external | UART7 (PE7 RX / PE8 TX), 115200 | [tfluna.rs](src/tfluna.rs) |
 
 MTF-01 flow/lidar drives `OPTICAL_FLOW` + `DISTANCE_SENSOR` (height-above-ground)
 and a flow dead-reckoning estimate ([nav.rs](src/nav.rs)); the ELRS receiver drives
-`RC_CHANNELS`; the SPL06 baro drives `SCALED_PRESSURE`. The compass and baro share
-I2C2, polled by one task. Detail in [docs/mtf01-elrs.md](docs/mtf01-elrs.md) and
-[docs/baro-spl06.md](docs/baro-spl06.md).
+`RC_CHANNELS`; the SPL06 baro drives `SCALED_PRESSURE`; the two side TF-Luna lidars
+drive `DISTANCE_SENSOR` (left/right orientation) for collision avoidance. The
+compass and baro share I2C2, polled by one task. Detail in
+[docs/mtf01-elrs.md](docs/mtf01-elrs.md), [docs/baro-spl06.md](docs/baro-spl06.md),
+and [docs/proximity-tfluna.md](docs/proximity-tfluna.md).
 
 ### Other devices on the board (present, not yet driven)
 

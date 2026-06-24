@@ -1,13 +1,65 @@
 # Sensor Fusion & Filtering — scky-fc
 
-How the firmware turns two noisy IMUs into one stable attitude estimate, and how
-that pipeline maps onto PX4's. Everything here is implemented in RTIC, with no
-heap and no blocking in the real-time path.
+How the firmware turns a box of noisy sensors into clean attitude, heading,
+position, and velocity. Everything is RTIC, no heap, no blocking in the real-time
+path. **This file is the map** — start here, then follow the links into each
+subsystem.
 
-- [filters.rs](../src/filters.rs) — low-pass + notch primitives
-- [ahrs.rs](../src/ahrs.rs) — Mahony complementary attitude filter
-- [estimator.rs](../src/estimator.rs) — rotation + dual-IMU combine + fusion driver
-- [main.rs](../src/main.rs) — RTIC wiring
+---
+
+## 0. The whole picture (read this first)
+
+The system is now big enough to deserve one diagram. Every sensor flows into one
+of **two estimators** — the **AHRS** (orientation) and the **nav EKF** (position/
+velocity) — and out as MAVLink:
+
+```text
+  SENSORS                    FILTERS / DRIVERS            ESTIMATORS                 OUTPUT (MAVLink)
+  ───────                    ─────────────────            ──────────                 ────────────────
+  2× IMU (SPI) ─────► filters.rs ─► estimator.rs ─┬─► AHRS (ahrs.rs) ──► attitude ──► ATTITUDE, HIGHRES_IMU
+  compass (I2C) ─────────────────────────────────┘     Mahony 9-DOF        │
+                                                        (roll/pitch/yaw)    │ world accel
+                                                                            ▼
+  GPS (UART) ─────► gps.rs ──────────────────────┐                   ┌────────────┐
+  baro (I2C) ─────► baro.rs ──────────────────────┼── measurements ─►│ nav EKF    │─► LOCAL_POSITION_NED
+  MTF-01 flow+lidar (UART) ─► mtf01.rs ─► nav.rs ─┤                   │ (ekf.rs)   │   GLOBAL_POSITION_INT
+                                                  │                   └────────────┘
+  (TF-Luna ×2 side lidar ─► tfluna.rs ─► obstacle/avoidance, DISTANCE_SENSOR — not fused into nav)
+  (ExpressLRS RX ─► crsf.rs ─► RC_CHANNELS — control input, not an estimator)
+```
+
+Two estimators, deliberately **separate** (loosely-coupled):
+
+| Estimator | Module | Estimates | Inputs | Doc |
+|---|---|---|---|---|
+| **AHRS** | [ahrs.rs](../src/ahrs.rs) | orientation (roll/pitch/yaw) | gyro, accel, mag | §1–§7 below |
+| **nav EKF** | [ekf.rs](../src/ekf.rs) | position, velocity | AHRS + GPS, baro, lidar, flow | [ekf.md](ekf.md) |
+
+### Where each thing is documented
+
+| Subsystem | Code | Doc |
+|---|---|---|
+| Digital filters (low-pass / notch) | [filters.rs](../src/filters.rs) | §3–§4 below |
+| Attitude (Mahony, incl. mag heading) | [ahrs.rs](../src/ahrs.rs), [estimator.rs](../src/estimator.rs) | §1–§7 below |
+| Position/velocity EKF | [ekf.rs](../src/ekf.rs) | [ekf.md](ekf.md) |
+| GPS + compass | [gps.rs](../src/gps.rs), [compass.rs](../src/compass.rs) | [gps-compass.md](gps-compass.md) |
+| Compass calibration (rotation / iron / declination) | [compass.rs](../src/compass.rs), [estimator.rs](../src/estimator.rs) | [compass-cal.md](compass-cal.md) |
+| Barometer | [baro.rs](../src/baro.rs) | [baro-spl06.md](baro-spl06.md) |
+| Optical flow + down lidar | [mtf01.rs](../src/mtf01.rs), [nav.rs](../src/nav.rs) | [mtf01-elrs.md](mtf01-elrs.md) |
+| ExpressLRS RC | [crsf.rs](../src/crsf.rs) | [mtf01-elrs.md](mtf01-elrs.md) |
+| Side obstacle lidars | [tfluna.rs](../src/tfluna.rs) | [proximity-tfluna.md](proximity-tfluna.md) |
+
+> **One calibration caveat spans both estimators:** heading accuracy needs the
+> compass calibrated (mount rotation, hard/soft-iron, declination). The mechanism
+> exists — constants in [main.rs](../src/main.rs) plus an in-field RC-triggered
+> hard-iron collector — but the *values* must be set/collected on hardware. Until
+> then, **heading** (and therefore EKF **horizontal** position/velocity, which is
+> rotated by heading) is correct only up to a constant offset; **vertical** fusion
+> and roll/pitch are unaffected. See [compass-cal.md](compass-cal.md) and
+> [ekf.md](ekf.md) §5.
+
+The rest of this file details the attitude half (the EKF half is in
+[ekf.md](ekf.md)).
 
 ---
 
