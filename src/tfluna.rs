@@ -32,6 +32,11 @@ pub struct TfLunaData {
     pub valid: bool,
     /// Count of valid frames decoded (liveness).
     pub frames: u32,
+    /// Total bytes received (including sync/body bytes).  Wraps at 2^32.
+    pub rx_bytes: u32,
+    /// Frames where the checksum did not match — non-zero means electrical noise
+    /// or a baud-rate mismatch.
+    pub checksum_errors: u32,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -60,6 +65,8 @@ impl TfLunaParser {
                 amplitude: 0,
                 valid: false,
                 frames: 0,
+                rx_bytes: 0,
+                checksum_errors: 0,
             },
         }
     }
@@ -71,6 +78,7 @@ impl TfLunaParser {
     /// Feed one received byte. Returns `true` when a checksum-valid frame was
     /// just decoded.
     pub fn push(&mut self, byte: u8) -> bool {
+        self.data.rx_bytes = self.data.rx_bytes.wrapping_add(1);
         match self.state {
             State::Sync1 => {
                 if byte == 0x59 {
@@ -108,6 +116,7 @@ impl TfLunaParser {
     fn process(&mut self) -> bool {
         let sum: u32 = self.buf[..8].iter().map(|&b| b as u32).sum();
         if (sum & 0xFF) as u8 != self.buf[8] {
+            self.data.checksum_errors = self.data.checksum_errors.wrapping_add(1);
             return false;
         }
         let distance = u16::from_le_bytes([self.buf[2], self.buf[3]]);

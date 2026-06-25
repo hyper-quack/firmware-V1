@@ -50,11 +50,12 @@ systick_monotonic!(Mono, 1000);
 mod app {
     use super::*;
 
+    use core::fmt::Write as FmtWrite;
     use embedded_hal::spi::MODE_3;
     use stm32h7xx_hal::gpio::{Output, Pin};
     use stm32h7xx_hal::prelude::*;
     use stm32h7xx_hal::rcc::rec::{Spi123ClkSel, UsbClkSel};
-    use stm32h7xx_hal::serial::Rx;
+    use stm32h7xx_hal::serial::{self, Rx};
     use stm32h7xx_hal::usb_hs::{UsbBus, USB2};
     use stm32h7xx_hal::{i2c, pac, spi};
     use usb_device::prelude::*;
@@ -265,7 +266,7 @@ mod app {
             .serial(
                 (
                     gpioa.pa9.into_alternate::<7>(),
-                    gpioa.pa10.into_alternate::<7>(),
+                    gpioa.pa10.into_alternate::<7>().internal_pull_up(true),
                 ),
                 GPS_BAUD.bps(),
                 ccdr.peripheral.USART1,
@@ -299,7 +300,7 @@ mod app {
             .serial(
                 (
                     gpiod.pd5.into_alternate::<7>(),
-                    gpiod.pd6.into_alternate::<7>(),
+                    gpiod.pd6.into_alternate::<7>().internal_pull_up(true),
                 ),
                 MTF01_BAUD.bps(),
                 ccdr.peripheral.USART2,
@@ -315,7 +316,7 @@ mod app {
             .serial(
                 (
                     gpiob.pb6.into_alternate::<14>(),
-                    gpiob.pb5.into_alternate::<14>(),
+                    gpiob.pb5.into_alternate::<14>().internal_pull_up(true),
                 ),
                 CRSF_BAUD.bps(),
                 ccdr.peripheral.UART5,
@@ -325,15 +326,19 @@ mod app {
         let (_crsf_tx, mut crsf_rx) = serial5.split();
         crsf_rx.listen();
 
-        // --- USART6 -> TF-Luna LEFT side lidar  (PC6 TX / PC7 RX) ----------
+        // --- USART6 -> TF-Luna LEFT side lidar  (T6/PC6 + R6/PC7) ----------
+        // The lidar is wired straight-through: its TX lands on the T6 pad (PC6),
+        // which is normally USART6_TX. We enable the peripheral's SWAP bit so RX
+        // is taken from PC6 and TX from PC7 — i.e. the FC reads the lidar on T6.
+        // With SWAP on, the pull-up belongs on the now-RX pin PC6.
         let serial6 = dp
             .USART6
             .serial(
                 (
-                    gpioc.pc6.into_alternate::<7>(),
+                    gpioc.pc6.into_alternate::<7>().internal_pull_up(true),
                     gpioc.pc7.into_alternate::<7>(),
                 ),
-                TFLUNA_BAUD.bps(),
+                serial::config::Config::new(TFLUNA_BAUD.bps()).swaptxrx(true),
                 ccdr.peripheral.USART6,
                 &ccdr.clocks,
             )
@@ -347,7 +352,7 @@ mod app {
             .serial(
                 (
                     gpioe.pe8.into_alternate::<7>(),
-                    gpioe.pe7.into_alternate::<7>(),
+                    gpioe.pe7.into_alternate::<7>().internal_pull_up(true),
                 ),
                 TFLUNA_BAUD.bps(),
                 ccdr.peripheral.UART7,
@@ -1008,6 +1013,24 @@ mod app {
                 let h = out2.lock(|o| o.health);
                 let ok = matches!(h, Health::Ok(_));
                 let frame = mavlink.imu_status(tick, 1, ok, ok, h.whoami());
+                pump_write(usb_dev, serial, frame.as_slice());
+            }
+
+            // TF-Luna LEFT diagnostic STATUSTEXT at 2 Hz: shows rx_bytes, frames,
+            // checksum_errors, distance, amplitude so we can distinguish:
+            //   rx=0           → no bytes at all (wiring / I2C mode / baud)
+            //   rx>0, fr=0     → bytes arrive but no valid sync (baud mismatch?)
+            //   fr>0, ck>0     → frames seen but checksum failures (noise)
+            //   fr>0, valid=F  → good frames, but amplitude<100 or dist OOR
+            if tick % 500 == 450 {
+                let l = prox_left.lock(|p| *p);
+                let mut s: heapless::String<50> = heapless::String::new();
+                let _ = write!(
+                    s,
+                    "L rx={} fr={} ck={} d={} a={}",
+                    l.rx_bytes, l.frames, l.checksum_errors, l.distance_cm, l.amplitude
+                );
+                let frame = mavlink.statustext(6, &s);
                 pump_write(usb_dev, serial, frame.as_slice());
             }
 
