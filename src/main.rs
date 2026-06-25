@@ -76,7 +76,8 @@ mod app {
     use crate::gps::{GpsData, NmeaParser};
     use crate::imu::{Health, Imu, ImuOut};
     use crate::mavlink::{
-        Decoder, Encoder, Inbound, MAV_SYS_STATUS_SENSOR_3D_ACCEL, MAV_SYS_STATUS_SENSOR_3D_GYRO,
+        DecodeDiag, Decoder, Encoder, Inbound, MAV_SYS_STATUS_SENSOR_3D_ACCEL,
+        MAV_SYS_STATUS_SENSOR_3D_GYRO, MAV_CMD_DO_MOTOR_TEST,
     };
     use crate::mtf01::{Mtf01Data, MspParser};
     use crate::nav::{Nav, NavState};
@@ -117,8 +118,9 @@ mod app {
     const CRSF_BAUD: u32 = 420_000;
     /// TF-Luna side-lidar baud (USART6 / UART7). Default is 115200.
     const TFLUNA_BAUD: u32 = 115_200;
-    /// ESC telemetry (BLHeli32 / KISS T pad → UART8 RX). Standard is 115200.
+    /// ESC telemetry (BLHeli32 / KISS T pad → USART3 RX / PD9). Standard is 115200.
     const ESC_TELEM_BAUD: u32 = 115_200;
+    const FIRMWARE_TAG: &str = "scky-fc esc-usb-diag 2026-06-25";
 
     // ---- Concrete types for the two IMU instances -------------------------
     type Imu1 = Imu<spi::Spi<pac::SPI1, spi::Enabled>, Pin<'A', 4, Output>>;
@@ -161,7 +163,7 @@ mod app {
         /// ESC controller: config, motor-test state, DShot command queue. Mutated
         /// by the USB command path, read by `dshot_task`.
         esc: Esc,
-        /// Latest ESC telemetry, published by the UART8 RX interrupt.
+        /// Latest ESC telemetry, published by the USART3 RX interrupt.
         esc_tlm: EscTelemetry,
     }
 
@@ -209,7 +211,7 @@ mod app {
     #[init]
     fn init(cx: init::Context) -> (Shared, Local) {
         let dp: pac::Peripherals = cx.device;
-        let cp = cx.core;
+        let mut cp = cx.core;
 
         // --- Power and clocks ------------------------------------------------
         // Use the internal 64 MHz HSI clock. The DAKEFPVH743 under test stops
@@ -232,7 +234,12 @@ mod app {
         // `per_ck` is sourced from the running HSI clock and is always present.
         ccdr.peripheral.kernel_spi123_clk_mux(Spi123ClkSel::Per);
 
-        // --- Systick monotonic @ 1 kHz -------------------------------------
+        // --- Cycle counter + Systick monotonic -----------------------------
+        // DShot bit-banging needs precise sub-microsecond timing. `asm::delay`
+        // is only "at least N cycles", so enable DWT CYCCNT and let dshot.rs
+        // schedule edges against the actual core cycle counter.
+        cp.DCB.enable_trace();
+        cp.DWT.enable_cycle_counter();
         Mono::start(cp.SYST, 64_000_000);
 
         // --- GPIO ----------------------------------------------------------
@@ -862,6 +869,8 @@ mod app {
         } = cx.shared;
 
         let mut tick: u32 = 0;
+        let mut boot_announces_left: u8 = 12;
+        let mut last_rx_diag_ms: u32 = 0;
         loop {
             // Service the USB stack every tick (~1 ms). Decode any host->device
             // bytes as inbound MAVLink commands so the OUT endpoint never stalls.
@@ -875,6 +884,7 @@ mod app {
                             // Acknowledge every decoded command with a STATUSTEXT so
                             // the ground station's feed shows the uplink is landing.
                             let is_set = matches!(cmd, Inbound::EscSet { .. });
+                            let is_motor_test = matches!(cmd, Inbound::MotorTest { .. });
                             let mut ack: heapless::String<50> = heapless::String::new();
                             match &cmd {
                                 Inbound::MotorTest { motor, throttle, .. } => {
@@ -891,11 +901,24 @@ mod app {
                                     let _ = write!(ack, "ESC: cmd {} -> tgt {}", command, target);
                                 }
                             }
-                            esc.lock(|e| apply_inbound(e, cmd, now));
+                            let accepted = esc.lock(|e| apply_inbound(e, cmd, now));
                             let frame = mavlink.statustext(6, &ack);
                             pump_write(usb_dev, serial, frame.as_slice());
+                            if !accepted {
+                                let mut reject: heapless::String<50> = heapless::String::new();
+                                let _ = write!(reject, "ESC: reject {}", ack.as_str());
+                                let frame = mavlink.statustext(3, &reject);
+                                pump_write(usb_dev, serial, frame.as_slice());
+                            }
+                            if is_motor_test {
+                                let frame = mavlink.command_ack(
+                                    MAV_CMD_DO_MOTOR_TEST,
+                                    if accepted { 0 } else { 4 },
+                                );
+                                pump_write(usb_dev, serial, frame.as_slice());
+                            }
                             // Echo config immediately after a write so the UI sticks.
-                            if is_set {
+                            if is_set || is_motor_test {
                                 let c = esc.lock(|e| e.config);
                                 let cf = mavlink.esc_config(
                                     c.cur_scale, c.cur_offset, c.refresh_hz, c.protocol.as_u8(),
@@ -903,6 +926,36 @@ mod app {
                                 );
                                 pump_write(usb_dev, serial, cf.as_slice());
                             }
+                        }
+                    }
+                    if let Some(diag) = decoder.take_diag() {
+                        let elapsed = now.wrapping_sub(last_rx_diag_ms);
+                        if elapsed >= 250 {
+                            last_rx_diag_ms = now;
+                            let mut s: heapless::String<50> = heapless::String::new();
+                            match diag {
+                                DecodeDiag::Mavlink1 => {
+                                    let _ = write!(s, "RX MAVLink1 unsupported");
+                                }
+                                DecodeDiag::CommandLong { command } => {
+                                    let _ = write!(s, "RX cmdlong {} ignored", command);
+                                }
+                                DecodeDiag::Unsupported { msgid } => {
+                                    let _ = write!(s, "RX ignored msg {}", msgid);
+                                }
+                                DecodeDiag::CrcFail { msgid, got, expected } => {
+                                    let _ = write!(
+                                        s,
+                                        "RX crc msg {} got {:04x} exp {:04x}",
+                                        msgid, got, expected
+                                    );
+                                }
+                                DecodeDiag::Oversize { msgid, len } => {
+                                    let _ = write!(s, "RX oversize msg {} len {}", msgid, len);
+                                }
+                            }
+                            let frame = mavlink.statustext(4, &s);
+                            pump_write(usb_dev, serial, frame.as_slice());
                         }
                     }
                 }
@@ -914,6 +967,14 @@ mod app {
                 tick = tick.wrapping_add(1);
                 Mono::delay(1.millis()).await;
                 continue;
+            }
+
+            // Announce a few times after USB config so the host can prove the
+            // board is running this exact firmware even if no sensor is healthy.
+            if boot_announces_left > 0 && tick % 250 == 1 {
+                boot_announces_left -= 1;
+                let frame = mavlink.statustext(6, FIRMWARE_TAG);
+                pump_write(usb_dev, serial, frame.as_slice());
             }
 
             // Two independent 20 Hz HIGHRES_IMU streams, staggered to avoid a
@@ -1123,6 +1184,13 @@ mod app {
                     &t.err,
                 );
                 pump_write(usb_dev, serial, frame.as_slice());
+                let frame = mavlink.esc_status(
+                    tick as u64 * 1_000,
+                    &t.rpm,
+                    &t.centivolt,
+                    &t.centiamp,
+                );
+                pump_write(usb_dev, serial, frame.as_slice());
             }
 
             // ESC config echo at 1 Hz so the ground station reflects FC state.
@@ -1139,6 +1207,23 @@ mod app {
                     c.pole_count,
                     c.mode3d_mask,
                 );
+                pump_write(usb_dev, serial, frame.as_slice());
+            }
+            if tick % 1000 == 30 {
+                let t = esc_tlm.lock(|t| *t);
+                let frame = mavlink.esc_info(tick as u64 * 1_000, &t.temp, &t.err);
+                pump_write(usb_dev, serial, frame.as_slice());
+            }
+            if tick % 500 == 125 {
+                let now = Mono::now().ticks() as u32;
+                let (master, active) = esc.lock(|e| (e.config.master_enabled, e.active_test(now)));
+                let mut s: heapless::String<50> = heapless::String::new();
+                if let Some((motor, value, remaining)) = active {
+                    let _ = write!(s, "ESC out master={} m{} dshot={} rem={}", master as u8, motor, value, remaining);
+                } else {
+                    let _ = write!(s, "ESC out master={} idle", master as u8);
+                }
+                let frame = mavlink.statustext(6, &s);
                 pump_write(usb_dev, serial, frame.as_slice());
             }
 
@@ -1196,10 +1281,15 @@ mod app {
     /// single poll() between packets; if the endpoint is still busy after
     /// draining, the remainder is dropped (a later frame will resynchronize).
     /// Apply one decoded inbound MAVLink command to the ESC controller.
-    fn apply_inbound(e: &mut Esc, cmd: Inbound, now_ms: u32) {
+    fn apply_inbound(e: &mut Esc, cmd: Inbound, now_ms: u32) -> bool {
         match cmd {
             Inbound::MotorTest { motor, throttle, timeout_s, .. } => {
-                e.start_test(motor, throttle, (timeout_s * 1000.0) as u32, now_ms);
+                let timeout_ms = if timeout_s.is_finite() && timeout_s > 0.0 {
+                    (timeout_s * 1000.0) as u32
+                } else {
+                    0
+                };
+                e.start_test(motor, throttle, timeout_ms, now_ms)
             }
             Inbound::EscSet {
                 master_enabled,
@@ -1211,18 +1301,24 @@ mod app {
                 pole_count,
                 cur_scale,
                 cur_offset,
-            } => e.apply_set(
-                master_enabled,
-                protocol,
-                refresh_hz,
-                bidir,
-                dir_mask,
-                mode3d_mask,
-                pole_count,
-                cur_scale,
-                cur_offset,
-            ),
-            Inbound::EscCmd { target, command } => e.queue_command(target, command),
+            } => {
+                e.apply_set(
+                    master_enabled,
+                    protocol,
+                    refresh_hz,
+                    bidir,
+                    dir_mask,
+                    mode3d_mask,
+                    pole_count,
+                    cur_scale,
+                    cur_offset,
+                );
+                true
+            }
+            Inbound::EscCmd { target, command } => {
+                e.queue_command(target, command);
+                true
+            }
         }
     }
 

@@ -37,6 +37,10 @@ const MSG_HIGHRES_IMU: u32 = 105;
 const CRC_HIGHRES_IMU: u8 = 93;
 const MSG_STATUSTEXT: u32 = 253;
 const CRC_STATUSTEXT: u8 = 83;
+const MSG_ESC_INFO: u32 = 290;
+const CRC_ESC_INFO: u8 = 251;
+const MSG_ESC_STATUS: u32 = 291;
+const CRC_ESC_STATUS: u8 = 10;
 const MSG_SCKY_IMU_STATUS: u32 = 42_000;
 const CRC_SCKY_IMU_STATUS: u8 = 38;
 const MSG_SCKY_ESC_TELEM: u32 = 42_010;
@@ -47,13 +51,15 @@ const CRC_SCKY_ESC_CONFIG: u8 = 55;
 // Inbound (ground-station → FC) message ids + crc_extra, used by `Decoder`.
 const MSG_COMMAND_LONG: u32 = 76;
 const CRC_COMMAND_LONG: u8 = 152;
+const MSG_COMMAND_ACK: u32 = 77;
+const CRC_COMMAND_ACK: u8 = 143;
 const MSG_SCKY_ESC_SET: u32 = 42_012;
 const CRC_SCKY_ESC_SET: u8 = 8;
 const MSG_SCKY_ESC_CMD: u32 = 42_013;
 const CRC_SCKY_ESC_CMD: u8 = 106;
 
 /// `MAV_CMD_DO_MOTOR_TEST` command id used inside `COMMAND_LONG`.
-const MAV_CMD_DO_MOTOR_TEST: u16 = 209;
+pub const MAV_CMD_DO_MOTOR_TEST: u16 = 209;
 
 pub type Frame = Vec<u8, MAX_FRAME_LEN>;
 
@@ -279,6 +285,19 @@ impl Encoder {
         self.frame(MSG_STATUSTEXT, CRC_STATUSTEXT, p.as_slice())
     }
 
+    /// COMMAND_ACK (message 77). Used so standard GCS motor-test tools get a
+    /// normal MAVLink acknowledgement in addition to STATUSTEXT.
+    pub fn command_ack(&mut self, command: u16, result: u8) -> Frame {
+        let mut p = Payload::new();
+        p.u16(command);
+        p.u8(result);
+        p.u8(0); // progress: not used
+        p.i32(0); // result_param2: not used
+        p.u8(0); // target_system: broadcast/not targeted
+        p.u8(0); // target_component: broadcast/not targeted
+        self.frame(MSG_COMMAND_ACK, CRC_COMMAND_ACK, p.as_slice())
+    }
+
     /// Per-device status from `message_definitions/scky.xml`.
     pub fn imu_status(
         &mut self,
@@ -398,6 +417,52 @@ impl Encoder {
             p.u8(v);
         }
         self.frame(MSG_SCKY_ESC_TELEM, CRC_SCKY_ESC_TELEM, p.as_slice())
+    }
+
+    /// Standard ESC_STATUS (message 291), indexed from motor 0. This mirrors the
+    /// custom SCKY_ESC_TELEM data through the common MAVLink dialect so generic
+    /// tools and dashboards can show ESC voltage/current/RPM without scky.xml.
+    pub fn esc_status(
+        &mut self,
+        time_usec: u64,
+        rpm: &[i32; 4],
+        centivolt: &[u16; 4],
+        centiamp: &[u16; 4],
+    ) -> Frame {
+        let mut p = Payload::new();
+        p.u64(time_usec);
+        for &v in rpm.iter() {
+            p.i32(v);
+        }
+        for &v in centivolt.iter() {
+            p.f32(v as f32 / 100.0);
+        }
+        for &v in centiamp.iter() {
+            p.f32(v as f32 / 100.0);
+        }
+        p.u8(0); // index of first ESC in this packet
+        self.frame(MSG_ESC_STATUS, CRC_ESC_STATUS, p.as_slice())
+    }
+
+    /// Standard ESC_INFO (message 290), low-rate static/status mirror.
+    pub fn esc_info(&mut self, time_usec: u64, temperature: &[u8; 4], error_count: &[u8; 4]) -> Frame {
+        let mut p = Payload::new();
+        p.u64(time_usec);
+        for &v in error_count.iter() {
+            p.u32(v as u32);
+        }
+        p.u16(0); // counter: no persistent sequence from the ESCs
+        for _ in 0..4 {
+            p.u16(0); // failure_flags: none reported by this decoder yet
+        }
+        for &v in temperature.iter() {
+            p.i16(v as i16);
+        }
+        p.u8(0); // index of first ESC
+        p.u8(4); // count
+        p.u8(1); // ESC_CONNECTION_TYPE_DSHOT
+        p.u8(0x0F); // bitmask: four ESCs known/configured
+        self.frame(MSG_ESC_INFO, CRC_ESC_INFO, p.as_slice())
     }
 
     /// SCKY_ESC_CONFIG (42011): echo of the live ESC configuration so the ground
@@ -547,6 +612,16 @@ pub enum Inbound {
     EscCmd { target: u8, command: u16 },
 }
 
+/// One-shot receive diagnostic from the streaming decoder.
+#[derive(Clone, Copy)]
+pub enum DecodeDiag {
+    Mavlink1,
+    CommandLong { command: u16 },
+    Unsupported { msgid: u32 },
+    CrcFail { msgid: u32, got: u16, expected: u16 },
+    Oversize { msgid: u32, len: u8 },
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum St {
     Stx,
@@ -578,6 +653,7 @@ pub struct Decoder {
     crc_rx: u16,
     crc_calc: u16,
     sig_left: u8,
+    diag: Option<DecodeDiag>,
 }
 
 impl Decoder {
@@ -592,6 +668,7 @@ impl Decoder {
             crc_rx: 0,
             crc_calc: 0,
             sig_left: 0,
+            diag: None,
         }
     }
 
@@ -615,6 +692,8 @@ impl Decoder {
                     self.idx = 0;
                     self.msgid = 0;
                     self.st = St::Len;
+                } else if byte == 0xFE {
+                    self.diag = Some(DecodeDiag::Mavlink1);
                 }
             }
             St::Len => {
@@ -694,6 +773,11 @@ impl Decoder {
         None
     }
 
+    /// Return and clear the most recent decoder diagnostic.
+    pub fn take_diag(&mut self) -> Option<DecodeDiag> {
+        self.diag.take()
+    }
+
     fn accumulate(&mut self, byte: u8) {
         self.crc_calc = crc_accumulate(byte, self.crc_calc);
     }
@@ -701,9 +785,27 @@ impl Decoder {
     /// Validate CRC and, if the message is recognised, decode it. Always leaves
     /// the machine ready (caller resets `st`).
     fn finish(&mut self) -> Option<Inbound> {
-        let extra = Self::crc_extra(self.msgid)?;
+        let extra = match Self::crc_extra(self.msgid) {
+            Some(extra) => extra,
+            None => {
+                self.diag = Some(DecodeDiag::Unsupported { msgid: self.msgid });
+                return None;
+            }
+        };
+        if self.len > MAX_PAYLOAD {
+            self.diag = Some(DecodeDiag::Oversize {
+                msgid: self.msgid,
+                len: self.len as u8,
+            });
+            return None;
+        }
         let crc = crc_accumulate(extra, self.crc_calc);
         if crc != self.crc_rx {
+            self.diag = Some(DecodeDiag::CrcFail {
+                msgid: self.msgid,
+                got: self.crc_rx,
+                expected: crc,
+            });
             return None;
         }
         // Zero-extend the (possibly truncated) payload for field extraction.
@@ -715,6 +817,7 @@ impl Decoder {
             MSG_COMMAND_LONG => {
                 let command = u16::from_le_bytes([p[28], p[29]]);
                 if command != MAV_CMD_DO_MOTOR_TEST {
+                    self.diag = Some(DecodeDiag::CommandLong { command });
                     return None;
                 }
                 Some(Inbound::MotorTest {

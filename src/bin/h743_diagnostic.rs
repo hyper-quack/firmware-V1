@@ -6,7 +6,9 @@
 #![no_std]
 #![no_main]
 
+use core::fmt::Write as _;
 use cortex_m_rt::entry;
+use heapless::String;
 use panic_halt as _;
 use stm32h7xx_hal::pac;
 use stm32h7xx_hal::prelude::*;
@@ -31,7 +33,7 @@ fn main() -> ! {
     let gpioa = dp.GPIOA.split(ccdr.peripheral.GPIOA);
     let gpiod = dp.GPIOD.split(ccdr.peripheral.GPIOD);
 
-    // DAKEFPVH743 LED0. Leave it on as an immediate "main reached" marker.
+    // DAKEFPVH743 LED0. It toggles while the main loop is alive.
     let mut led = gpiod.pd10.into_push_pull_output();
     let _ = led.set_high();
 
@@ -62,11 +64,61 @@ fn main() -> ! {
         .device_class(usbd_serial::USB_CLASS_CDC)
         .build();
 
+    let mut ms: u32 = 0;
+    let mut rx_total: u32 = 0;
+    let mut last_rx: usize = 0;
+    let mut last0: u8 = 0;
+    let mut last1: u8 = 0;
+
     loop {
-        if device.poll(&mut [&mut serial]) {
-            let mut input = [0u8; 64];
-            let _ = serial.read(&mut input);
-            let _ = serial.write(b"DAKEFPVH743 boot OK\r\n");
+        device.poll(&mut [&mut serial]);
+
+        let mut input = [0u8; 64];
+        if let Ok(n) = serial.read(&mut input) {
+            if n > 0 {
+                rx_total = rx_total.wrapping_add(n as u32);
+                last_rx = n;
+                last0 = input[0];
+                last1 = if n > 1 { input[1] } else { 0 };
+                write_all(&mut device, &mut serial, b"RX ");
+                write_all(&mut device, &mut serial, &input[..n]);
+                write_all(&mut device, &mut serial, b"\r\n");
+            }
+        }
+
+        if ms % 500 == 0 {
+            let _ = led.toggle();
+            let mut line: String<96> = String::new();
+            let _ = write!(
+                line,
+                "SCKY USB RAW DIAG t={}ms state={:?} rx_total={} last_n={} b0={:02x} b1={:02x}\r\n",
+                ms,
+                device.state(),
+                rx_total,
+                last_rx,
+                last0,
+                last1
+            );
+            write_all(&mut device, &mut serial, line.as_bytes());
+        }
+
+        ms = ms.wrapping_add(1);
+        cortex_m::asm::delay(64_000);
+    }
+}
+
+fn write_all(
+    device: &mut UsbDevice<'static, UsbBus<USB2>>,
+    serial: &mut usbd_serial::SerialPort<'static, UsbBus<USB2>>,
+    mut data: &[u8],
+) {
+    while !data.is_empty() {
+        match serial.write(data) {
+            Ok(n) if n > 0 => data = &data[n..],
+            _ => {
+                device.poll(&mut [serial]);
+                break;
+            }
         }
     }
 }

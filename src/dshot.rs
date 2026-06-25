@@ -16,11 +16,11 @@
 //! (all on GPIOA) is taken from the DAKEFPVH743 hwdef (TIM2 outputs) — see
 //! [`MOTOR_BITS`] / [`port`].
 //!
-//! Frames are sent with interrupts enabled, so a higher-priority ISR can preempt
-//! a bit and corrupt it. DShot carries a 4-bit CRC, so the ESC silently drops a
-//! corrupted frame; at the refresh rates used here the occasional dropped frame
-//! is invisible on the bench. DShot150 is the default because its 6.67 µs bit is
-//! the most tolerant of jitter at the board's 64 MHz HSI core clock.
+//! Frames are emitted with interrupts briefly masked and edges are scheduled
+//! against DWT CYCCNT, so a UART/IMU interrupt and `asm::delay` loop overhead
+//! cannot stretch one DShot bit and make the ESC reject the packet. DShot150 is
+//! the default because its 6.67 µs bit has the most timing margin at the board's
+//! 64 MHz HSI core clock.
 
 use stm32h7xx_hal::pac;
 
@@ -131,25 +131,36 @@ pub fn send_frames(frames: &[u16; 4], proto: Protocol) {
     // motor lines whose bit is 0 (pulled low early to encode a '0').
     let set_all: u32 = MOTOR_BITS.iter().fold(0, |m, &b| m | (1 << b as u32));
     let reset_all: u32 = set_all << 16;
-
-    // SAFETY: BSRR is atomic and write-only; concurrent HAL use of other pins on
-    // this port is unaffected.
-    let p = unsafe { &*port() };
-
-    for shift in (0..16u16).rev() {
-        // Mask of lines that should go LOW early (their current bit == 0).
+    let mut zero_resets = [0u32; 16];
+    for (bit_idx, shift) in (0..16u16).rev().enumerate() {
         let mut zero_reset: u32 = 0;
         for (i, &b) in MOTOR_BITS.iter().enumerate() {
             if (frames[i] >> shift) & 1 == 0 {
                 zero_reset |= 1 << (b as u32 + 16);
             }
         }
-
-        unsafe { p.bsrr.write(|w| w.bits(set_all)) }; // all high
-        cortex_m::asm::delay(t_low);
-        unsafe { p.bsrr.write(|w| w.bits(zero_reset)) }; // '0' lines low
-        cortex_m::asm::delay(t_mid);
-        unsafe { p.bsrr.write(|w| w.bits(reset_all)) }; // all low
-        cortex_m::asm::delay(t_rest);
+        zero_resets[bit_idx] = zero_reset;
     }
+
+    // SAFETY: BSRR is atomic and write-only; concurrent HAL use of other pins on
+    // this port is unaffected.
+    let p = unsafe { &*port() };
+
+    cortex_m::interrupt::free(|_| {
+        let mut start = cortex_m::peripheral::DWT::cycle_count();
+        for &zero_reset in zero_resets.iter() {
+            unsafe { p.bsrr.write(|w| w.bits(set_all)) }; // all high
+            wait_until(start.wrapping_add(t_low));
+            unsafe { p.bsrr.write(|w| w.bits(zero_reset)) }; // '0' lines low
+            wait_until(start.wrapping_add(t_low + t_mid));
+            unsafe { p.bsrr.write(|w| w.bits(reset_all)) }; // all low
+            start = start.wrapping_add(t_low + t_mid + t_rest);
+            wait_until(start);
+        }
+    });
+}
+
+#[inline(always)]
+fn wait_until(deadline: u32) {
+    while (cortex_m::peripheral::DWT::cycle_count().wrapping_sub(deadline) as i32) < 0 {}
 }

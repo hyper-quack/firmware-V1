@@ -1,0 +1,1 @@
+/home/poorcsky/Documents/scky_firmware/target/thumbv7em-none-eabihf/release/h743_motor_diag: /home/poorcsky/Documents/scky_firmware/build.rs /home/poorcsky/Documents/scky_firmware/memory.x /home/poorcsky/Documents/scky_firmware/src/bin/h743_motor_diag.rs /home/poorcsky/Documents/scky_firmware/src/dshot.rs
