@@ -39,6 +39,21 @@ const MSG_STATUSTEXT: u32 = 253;
 const CRC_STATUSTEXT: u8 = 83;
 const MSG_SCKY_IMU_STATUS: u32 = 42_000;
 const CRC_SCKY_IMU_STATUS: u8 = 38;
+const MSG_SCKY_ESC_TELEM: u32 = 42_010;
+const CRC_SCKY_ESC_TELEM: u8 = 91;
+const MSG_SCKY_ESC_CONFIG: u32 = 42_011;
+const CRC_SCKY_ESC_CONFIG: u8 = 55;
+
+// Inbound (ground-station → FC) message ids + crc_extra, used by `Decoder`.
+const MSG_COMMAND_LONG: u32 = 76;
+const CRC_COMMAND_LONG: u8 = 152;
+const MSG_SCKY_ESC_SET: u32 = 42_012;
+const CRC_SCKY_ESC_SET: u8 = 8;
+const MSG_SCKY_ESC_CMD: u32 = 42_013;
+const CRC_SCKY_ESC_CMD: u8 = 106;
+
+/// `MAV_CMD_DO_MOTOR_TEST` command id used inside `COMMAND_LONG`.
+const MAV_CMD_DO_MOTOR_TEST: u16 = 209;
 
 pub type Frame = Vec<u8, MAX_FRAME_LEN>;
 
@@ -351,6 +366,68 @@ impl Encoder {
         self.frame(MSG_RC_CHANNELS, CRC_RC_CHANNELS, p.as_slice())
     }
 
+    /// SCKY_ESC_TELEM (42010): per-motor ESC telemetry plus aggregate consumption
+    /// and analog current. `centivolt`/`centiamp` are hundredths of a volt/amp.
+    #[allow(clippy::too_many_arguments)]
+    pub fn esc_telem(
+        &mut self,
+        mah_consumed: f32,
+        analog_current: f32,
+        rpm: &[i32; 4],
+        centivolt: &[u16; 4],
+        centiamp: &[u16; 4],
+        temperature: &[u8; 4],
+        error_count: &[u8; 4],
+    ) -> Frame {
+        let mut p = Payload::new();
+        p.f32(mah_consumed);
+        p.f32(analog_current);
+        for &v in rpm.iter() {
+            p.i32(v);
+        }
+        for &v in centivolt.iter() {
+            p.u16(v);
+        }
+        for &v in centiamp.iter() {
+            p.u16(v);
+        }
+        for &v in temperature.iter() {
+            p.u8(v);
+        }
+        for &v in error_count.iter() {
+            p.u8(v);
+        }
+        self.frame(MSG_SCKY_ESC_TELEM, CRC_SCKY_ESC_TELEM, p.as_slice())
+    }
+
+    /// SCKY_ESC_CONFIG (42011): echo of the live ESC configuration so the ground
+    /// station reflects the FC's actual state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn esc_config(
+        &mut self,
+        cur_scale: f32,
+        cur_offset: f32,
+        refresh_hz: u16,
+        protocol: u8,
+        master_enabled: bool,
+        bidir: bool,
+        dir_mask: u8,
+        pole_count: u8,
+        mode3d_mask: u8,
+    ) -> Frame {
+        let mut p = Payload::new();
+        p.f32(cur_scale);
+        p.f32(cur_offset);
+        p.u16(refresh_hz);
+        p.u8(protocol);
+        p.u8(master_enabled as u8);
+        p.u8(bidir as u8);
+        p.u8(dir_mask);
+        p.u8(pole_count);
+        p.u8(mode3d_mask);
+        self.frame(MSG_SCKY_ESC_CONFIG, CRC_SCKY_ESC_CONFIG, p.as_slice())
+    }
+
     fn frame(&mut self, message_id: u32, crc_extra: u8, payload: &[u8]) -> Frame {
         let mut out = Frame::new();
         let header = [
@@ -430,4 +507,245 @@ impl Payload {
     fn f32(&mut self, value: f32) {
         let _ = self.bytes.extend_from_slice(&value.to_le_bytes());
     }
+}
+
+// ===========================================================================
+// Inbound (ground-station → FC) decoding.
+//
+// The firmware's first RX-side MAVLink. A small byte-at-a-time state machine
+// reassembles MAVLink 2 frames, validates the CRC (with the per-message
+// crc_extra), and yields the few commands this firmware acts on. Signed frames
+// (incompat flag 0x01) are parsed and their 13-byte signature skipped; the
+// signature itself is not verified. Payloads are zero-extended to the message's
+// full length before field extraction so MAVLink-2 trailing-zero truncation is
+// handled transparently.
+// ===========================================================================
+
+/// A command the firmware understands.
+pub enum Inbound {
+    /// MAV_CMD_DO_MOTOR_TEST. `motor` is 1-based.
+    MotorTest {
+        motor: u8,
+        throttle_type: u8,
+        throttle: f32,
+        timeout_s: f32,
+        count: u8,
+    },
+    /// SCKY_ESC_SET: write the live ESC configuration.
+    EscSet {
+        master_enabled: bool,
+        protocol: u8,
+        refresh_hz: u16,
+        bidir: bool,
+        dir_mask: u8,
+        mode3d_mask: u8,
+        pole_count: u8,
+        cur_scale: f32,
+        cur_offset: f32,
+    },
+    /// SCKY_ESC_CMD: one-shot DShot special command. `target` 0 = all, 1..4 = one.
+    EscCmd { target: u8, command: u16 },
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum St {
+    Stx,
+    Len,
+    Incompat,
+    Compat,
+    Seq,
+    SysId,
+    CompId,
+    MsgId0,
+    MsgId1,
+    MsgId2,
+    Payload,
+    Crc0,
+    Crc1,
+    Sig,
+}
+
+const MAX_PAYLOAD: usize = 64;
+
+/// Streaming MAVLink 2 frame decoder.
+pub struct Decoder {
+    st: St,
+    len: usize,
+    incompat: u8,
+    msgid: u32,
+    payload: [u8; MAX_PAYLOAD],
+    idx: usize,
+    crc_rx: u16,
+    crc_calc: u16,
+    sig_left: u8,
+}
+
+impl Decoder {
+    pub const fn new() -> Self {
+        Self {
+            st: St::Stx,
+            len: 0,
+            incompat: 0,
+            msgid: 0,
+            payload: [0; MAX_PAYLOAD],
+            idx: 0,
+            crc_rx: 0,
+            crc_calc: 0,
+            sig_left: 0,
+        }
+    }
+
+    /// crc_extra for the inbound messages we validate; `None` = not one we accept.
+    fn crc_extra(msgid: u32) -> Option<u8> {
+        match msgid {
+            MSG_COMMAND_LONG => Some(CRC_COMMAND_LONG),
+            MSG_SCKY_ESC_SET => Some(CRC_SCKY_ESC_SET),
+            MSG_SCKY_ESC_CMD => Some(CRC_SCKY_ESC_CMD),
+            _ => None,
+        }
+    }
+
+    /// Feed one received byte. Returns a decoded command when a CRC-valid frame
+    /// for a recognised message completes.
+    pub fn push(&mut self, byte: u8) -> Option<Inbound> {
+        match self.st {
+            St::Stx => {
+                if byte == STX_V2 {
+                    self.crc_calc = 0xFFFF;
+                    self.idx = 0;
+                    self.msgid = 0;
+                    self.st = St::Len;
+                }
+            }
+            St::Len => {
+                self.len = byte as usize;
+                self.accumulate(byte);
+                self.st = St::Incompat;
+            }
+            St::Incompat => {
+                self.incompat = byte;
+                self.accumulate(byte);
+                self.st = St::Compat;
+            }
+            St::Compat => {
+                self.accumulate(byte);
+                self.st = St::Seq;
+            }
+            St::Seq => {
+                self.accumulate(byte);
+                self.st = St::SysId;
+            }
+            St::SysId => {
+                self.accumulate(byte);
+                self.st = St::CompId;
+            }
+            St::CompId => {
+                self.accumulate(byte);
+                self.st = St::MsgId0;
+            }
+            St::MsgId0 => {
+                self.msgid = byte as u32;
+                self.accumulate(byte);
+                self.st = St::MsgId1;
+            }
+            St::MsgId1 => {
+                self.msgid |= (byte as u32) << 8;
+                self.accumulate(byte);
+                self.st = St::MsgId2;
+            }
+            St::MsgId2 => {
+                self.msgid |= (byte as u32) << 16;
+                self.accumulate(byte);
+                self.st = if self.len == 0 { St::Crc0 } else { St::Payload };
+            }
+            St::Payload => {
+                if self.idx < MAX_PAYLOAD {
+                    self.payload[self.idx] = byte;
+                }
+                self.accumulate(byte);
+                self.idx += 1;
+                if self.idx >= self.len {
+                    self.st = St::Crc0;
+                }
+            }
+            St::Crc0 => {
+                self.crc_rx = byte as u16;
+                self.st = St::Crc1;
+            }
+            St::Crc1 => {
+                self.crc_rx |= (byte as u16) << 8;
+                let result = self.finish();
+                // After the CRC, a signed frame carries 13 signature bytes.
+                if self.incompat & 0x01 != 0 {
+                    self.sig_left = 13;
+                    self.st = St::Sig;
+                } else {
+                    self.st = St::Stx;
+                }
+                return result;
+            }
+            St::Sig => {
+                self.sig_left -= 1;
+                if self.sig_left == 0 {
+                    self.st = St::Stx;
+                }
+            }
+        }
+        None
+    }
+
+    fn accumulate(&mut self, byte: u8) {
+        self.crc_calc = crc_accumulate(byte, self.crc_calc);
+    }
+
+    /// Validate CRC and, if the message is recognised, decode it. Always leaves
+    /// the machine ready (caller resets `st`).
+    fn finish(&mut self) -> Option<Inbound> {
+        let extra = Self::crc_extra(self.msgid)?;
+        let crc = crc_accumulate(extra, self.crc_calc);
+        if crc != self.crc_rx {
+            return None;
+        }
+        // Zero-extend the (possibly truncated) payload for field extraction.
+        let mut p = [0u8; MAX_PAYLOAD];
+        let n = self.len.min(MAX_PAYLOAD);
+        p[..n].copy_from_slice(&self.payload[..n]);
+
+        match self.msgid {
+            MSG_COMMAND_LONG => {
+                let command = u16::from_le_bytes([p[28], p[29]]);
+                if command != MAV_CMD_DO_MOTOR_TEST {
+                    return None;
+                }
+                Some(Inbound::MotorTest {
+                    motor: f32_at(&p, 0) as u8,           // param1: motor instance
+                    throttle_type: f32_at(&p, 4) as u8,   // param2: throttle type
+                    throttle: f32_at(&p, 8),              // param3: throttle value
+                    timeout_s: f32_at(&p, 12),            // param4: timeout (s)
+                    count: f32_at(&p, 16) as u8,          // param5: motor count
+                })
+            }
+            MSG_SCKY_ESC_SET => Some(Inbound::EscSet {
+                cur_scale: f32_at(&p, 0),
+                cur_offset: f32_at(&p, 4),
+                refresh_hz: u16::from_le_bytes([p[8], p[9]]),
+                protocol: p[10],
+                master_enabled: p[11] != 0,
+                bidir: p[12] != 0,
+                dir_mask: p[13],
+                pole_count: p[14],
+                mode3d_mask: p[15],
+            }),
+            MSG_SCKY_ESC_CMD => Some(Inbound::EscCmd {
+                target: p[2],
+                command: p[3] as u16,
+            }),
+            _ => None,
+        }
+    }
+}
+
+#[inline]
+fn f32_at(p: &[u8], off: usize) -> f32 {
+    f32::from_le_bytes([p[off], p[off + 1], p[off + 2], p[off + 3]])
 }

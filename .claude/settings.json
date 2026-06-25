@@ -12,7 +12,19 @@
       "Bash(python3 -c \"import serial; print\\('pyserial ok'\\)\")",
       "Bash(chmod +x /home/poorcsky/Documents/scky_firmware/tests/lidar-debug.py)",
       "Bash(python3 /home/poorcsky/Documents/scky_firmware/tests/lidar-debug.py --help)",
-      "Bash(probe-rs list *)"
+      "Bash(probe-rs list *)",
+      "Bash(python3 crc.py)",
+      "Bash(sort -u -t. -k2)",
+      "Bash(grep -nE \"async fn usb_task|local = \\\\[usb_dev|SharedResources|let _ = serial.read|mut scratch|mut navsol|\\\\.\\\\.$\" /home/poorcsky/Documents/scky_firmware/src/main.rs)",
+      "Bash(npm run *)",
+      "Bash(which node *)",
+      "Read(//usr/local/bin/**)",
+      "Bash(find / -name node -type f -executable 2>/dev/null | grep -v node_modules | head; echo \"--- head of project tsc bin ---\"; head -1 /home/poorcsky/Documents/csky_platform/node_modules/.bin/tsc 2>/dev/null; echo \"--- asdf/snap/nix ---\"; ls /home/poorcsky/.asdf/shims/node /snap/bin/node 2>/dev/null)",
+      "Read(//snap/bin/**)",
+      "Bash(bash -lic 'node --version && which npm')",
+      "Bash(/home/poorcsky/.cache/ms-playwright-go/1.57.0/node --version)",
+      "Bash(/home/poorcsky/.cache/ms-playwright-go/1.57.0/node node_modules/typescript/bin/tsc --noEmit)",
+      "Bash(echo \"=== exit: $? ===\")"
     ],
     "additionalDirectories": [
       "/home/poorcsky/Documents/scky_firmware/src"

@@ -11,5 +11,45 @@
       <field type="uint8_t" name="healthy" enum="MAV_BOOL">1 when the device is usable by the estimator.</field>
       <field type="uint8_t" name="whoami" display="hex">Raw InvenSense WHO_AM_I register value.</field>
     </message>
+    <message id="42010" name="SCKY_ESC_TELEM">
+      <description>Per-motor ESC telemetry (BLHeli32 / KISS) plus aggregate consumption and analog current. crc_extra=91.</description>
+      <field type="float" name="mah_consumed" units="mAh">Consumption reported by the most recent ESC record.</field>
+      <field type="float" name="analog_current" units="A">Aggregate pack current (sum of per-motor current).</field>
+      <field type="int32_t[4]" name="rpm" units="rpm">Mechanical RPM per motor (eRPM / pole pairs).</field>
+      <field type="uint16_t[4]" name="centivolt" units="cV">ESC input voltage per motor, hundredths of a volt.</field>
+      <field type="uint16_t[4]" name="centiamp" units="cA">ESC current per motor, hundredths of an amp.</field>
+      <field type="uint8_t[4]" name="temperature" units="degC">ESC temperature per motor.</field>
+      <field type="uint8_t[4]" name="error_count">ESC error / desync count per motor.</field>
+    </message>
+    <message id="42011" name="SCKY_ESC_CONFIG">
+      <description>Live ESC configuration echoed by the FC. crc_extra=55.</description>
+      <field type="float" name="cur_scale">Analog current-sense scale (C pad).</field>
+      <field type="float" name="cur_offset" units="mV">Analog current-sense offset (C pad).</field>
+      <field type="uint16_t" name="refresh_hz" units="Hz">DShot output refresh rate.</field>
+      <field type="uint8_t" name="protocol">0=DSHOT150, 1=DSHOT300, 2=DSHOT600.</field>
+      <field type="uint8_t" name="master_enabled" enum="MAV_BOOL">Master output enable (the arm).</field>
+      <field type="uint8_t" name="bidir" enum="MAV_BOOL">Bidirectional-DShot request flag.</field>
+      <field type="uint8_t" name="dir_mask" display="bitmask">Bit per motor: 1 = reversed.</field>
+      <field type="uint8_t" name="pole_count">Motor magnetic pole count (eRPM-&gt;RPM).</field>
+      <field type="uint8_t" name="mode3d_mask" display="bitmask">Bit per motor: 1 = 3D mode on.</field>
+    </message>
+    <message id="42012" name="SCKY_ESC_SET">
+      <description>Write the live ESC configuration (ground station -&gt; FC). Same fields as SCKY_ESC_CONFIG. crc_extra=8.</description>
+      <field type="float" name="cur_scale">Analog current-sense scale (C pad).</field>
+      <field type="float" name="cur_offset" units="mV">Analog current-sense offset (C pad).</field>
+      <field type="uint16_t" name="refresh_hz" units="Hz">DShot output refresh rate.</field>
+      <field type="uint8_t" name="protocol">0=DSHOT150, 1=DSHOT300, 2=DSHOT600.</field>
+      <field type="uint8_t" name="master_enabled" enum="MAV_BOOL">Master output enable (the arm).</field>
+      <field type="uint8_t" name="bidir" enum="MAV_BOOL">Bidirectional-DShot request flag.</field>
+      <field type="uint8_t" name="dir_mask" display="bitmask">Bit per motor: 1 = reversed.</field>
+      <field type="uint8_t" name="pole_count">Motor magnetic pole count (eRPM-&gt;RPM).</field>
+      <field type="uint8_t" name="mode3d_mask" display="bitmask">Bit per motor: 1 = 3D mode on.</field>
+    </message>
+    <message id="42013" name="SCKY_ESC_CMD">
+      <description>One-shot DShot special command (ground station -&gt; FC). crc_extra=106.</description>
+      <field type="uint16_t" name="value">Reserved (0).</field>
+      <field type="uint8_t" name="target">0 = all motors, 1..4 = a single motor.</field>
+      <field type="uint8_t" name="command">DShot command number (1..5 beacon, 9/10 3D off/on, 12 save, 20/21 spin normal/reversed).</field>
+    </message>
   </messages>
 </mavlink>

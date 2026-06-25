@@ -25,7 +25,10 @@ mod ahrs;
 mod baro;
 mod compass;
 mod crsf;
+mod dshot;
 mod ekf;
+mod esc;
+mod esc_telem;
 mod estimator;
 mod filters;
 mod gps;
@@ -65,11 +68,16 @@ mod app {
     use crate::compass::{Compass, MagCal, MagData, MagRotation};
     use crate::crsf::{CrsfParser, RcChannels};
     use crate::ekf::{Ekf, NavSolution};
+    use crate::dshot;
+    use crate::esc::{Esc, EscTelemetry};
+    use crate::esc_telem::EscTelemParser;
     use crate::estimator::{Estimator, Rotation};
     use crate::filters::ImuLpf;
     use crate::gps::{GpsData, NmeaParser};
     use crate::imu::{Health, Imu, ImuOut};
-    use crate::mavlink::{Encoder, MAV_SYS_STATUS_SENSOR_3D_ACCEL, MAV_SYS_STATUS_SENSOR_3D_GYRO};
+    use crate::mavlink::{
+        Decoder, Encoder, Inbound, MAV_SYS_STATUS_SENSOR_3D_ACCEL, MAV_SYS_STATUS_SENSOR_3D_GYRO,
+    };
     use crate::mtf01::{Mtf01Data, MspParser};
     use crate::nav::{Nav, NavState};
     use crate::tfluna::{TfLunaData, TfLunaParser};
@@ -109,6 +117,8 @@ mod app {
     const CRSF_BAUD: u32 = 420_000;
     /// TF-Luna side-lidar baud (USART6 / UART7). Default is 115200.
     const TFLUNA_BAUD: u32 = 115_200;
+    /// ESC telemetry (BLHeli32 / KISS T pad → UART8 RX). Standard is 115200.
+    const ESC_TELEM_BAUD: u32 = 115_200;
 
     // ---- Concrete types for the two IMU instances -------------------------
     type Imu1 = Imu<spi::Spi<pac::SPI1, spi::Enabled>, Pin<'A', 4, Output>>;
@@ -148,6 +158,11 @@ mod app {
         accel_w: [f32; 3],
         /// Fused navigation solution, published by the EKF task.
         navsol: NavSolution,
+        /// ESC controller: config, motor-test state, DShot command queue. Mutated
+        /// by the USB command path, read by `dshot_task`.
+        esc: Esc,
+        /// Latest ESC telemetry, published by the UART8 RX interrupt.
+        esc_tlm: EscTelemetry,
     }
 
     #[local]
@@ -184,6 +199,11 @@ mod app {
         tfl_right_parser: TfLunaParser,
         // Navigation EKF (position + velocity).
         ekf: Ekf,
+        // ESC telemetry (BLHeli32 / KISS) receiver + decoder, owned by USART3 ISR.
+        esc_tx_rx: Rx<pac::USART3>,
+        esc_tx_parser: EscTelemParser,
+        // Inbound MAVLink command decoder, owned by `usb_task`.
+        decoder: Decoder,
     }
 
     #[init]
@@ -362,6 +382,31 @@ mod app {
         let (_tfl_r_tx, mut tfl_right_rx) = serial7.split();
         tfl_right_rx.listen();
 
+        // --- USART3 -> ESC telemetry (BLHeli32 / KISS T pad)  (PD8 TX / PD9 RX) -
+        // Per the DAKEFPVH743 hwdef, SERIAL3 = USART3 is the ESC-telemetry port,
+        // so the T pad lands on PD9. One-way; RX is interrupt-driven like the
+        // other sensor UARTs.
+        let serial3 = dp
+            .USART3
+            .serial(
+                (
+                    gpiod.pd8.into_alternate::<7>(),
+                    gpiod.pd9.into_alternate::<7>().internal_pull_up(true),
+                ),
+                ESC_TELEM_BAUD.bps(),
+                ccdr.peripheral.USART3,
+                &ccdr.clocks,
+            )
+            .unwrap();
+        let (_esc_tx_tx, mut esc_tx_rx) = serial3.split();
+        esc_tx_rx.listen();
+
+        // --- Motor outputs: bit-banged DShot on PA0..PA3 (M1..M4) -----------
+        // Confirmed against the DAKEFPVH743 hwdef: M1..M4 = PA0..PA3 (TIM2). This
+        // firmware drives them as plain GPIO (bit-bang). Pins idle low; nothing
+        // spins until the ground station enables the ESC master switch.
+        dshot::init_pins();
+
         // --- USB CDC-ACM  (OTG2_FS internal full-speed PHY, PA11/PA12) ------
         let usb = USB2::new(
             dp.OTG2_HS_GLOBAL,
@@ -408,6 +453,7 @@ mod app {
         nav_task::spawn().ok();
         ekf_task::spawn().ok();
         usb_task::spawn().ok();
+        dshot_task::spawn().ok();
 
         (
             Shared {
@@ -430,6 +476,8 @@ mod app {
                 prox_right: TfLunaData::default(),
                 accel_w: [0.0; 3],
                 navsol: NavSolution::default(),
+                esc: Esc::new(),
+                esc_tlm: EscTelemetry::new(),
             },
             Local {
                 imu1,
@@ -455,6 +503,9 @@ mod app {
                 tfl_right_rx,
                 tfl_right_parser: TfLunaParser::new(),
                 ekf: Ekf::new(),
+                esc_tx_rx,
+                esc_tx_parser: EscTelemParser::new(),
+                decoder: Decoder::new(),
             },
         )
     }
@@ -637,6 +688,35 @@ mod app {
         }
     }
 
+    /// USART3 RX interrupt — BLHeli32 / KISS ESC telemetry on the T pad. Decodes
+    /// 10-byte CRC-checked records and stores them round-robin into `esc_tlm`.
+    #[task(binds = USART3, priority = 4, local = [esc_tx_rx, esc_tx_parser], shared = [esc, esc_tlm])]
+    fn usart3_rx(mut cx: usart3_rx::Context) {
+        let parser = cx.local.esc_tx_parser;
+        let poles = cx.shared.esc.lock(|e| e.config.pole_count);
+        while let Ok(byte) = cx.local.esc_tx_rx.read() {
+            if let Some(frame) = parser.push(byte) {
+                cx.shared.esc_tlm.lock(|t| t.ingest(frame, poles));
+            }
+        }
+    }
+
+    /// Bit-banged DShot output. Builds the four frames from the ESC controller
+    /// (honouring the master interlock + motor-test timeout) and clocks them out
+    /// at the configured refresh rate. Priority 1 so the IMU sampling (prio 3) and
+    /// estimator (prio 2) always preempt the ~tens-of-µs bit-bang burst.
+    #[task(priority = 1, shared = [esc])]
+    async fn dshot_task(mut cx: dshot_task::Context) {
+        loop {
+            let now = Mono::now().ticks() as u32;
+            let (frames, proto, refresh) =
+                cx.shared.esc.lock(|e| (e.frames(now), e.config.protocol, e.config.refresh_hz));
+            dshot::send_frames(&frames, proto);
+            let period_ms = (1000 / u32::from(refresh).max(1)).max(1);
+            Mono::delay(period_ms.millis()).await;
+        }
+    }
+
     /// I2C2 sensor poll — magnetometer + SPL06 barometer share the bus, so one
     /// task owns it. Compass every loop (~100 Hz for the AHRS); baro every 5th
     /// loop (~20 Hz, well above its 8 Hz conversion rate). Priority 1; each
@@ -757,11 +837,12 @@ mod app {
     /// Owns the whole USB stack: polls it at ~1 kHz (keeps enumeration alive and
     /// flushes the IN endpoint) and streams MAVLink 2 telemetry. Lowest
     /// priority, so it can never delay the IMU sampling tasks.
-    #[task(priority = 1, local = [usb_dev, serial, mavlink], shared = [out1, out2, gps, mag, att, flow, rc, navs, baro, prox_left, prox_right, navsol])]
+    #[task(priority = 1, local = [usb_dev, serial, mavlink, decoder], shared = [out1, out2, gps, mag, att, flow, rc, navs, baro, prox_left, prox_right, navsol, esc, esc_tlm])]
     async fn usb_task(cx: usb_task::Context) {
         let usb_dev = cx.local.usb_dev;
         let serial = cx.local.serial;
         let mavlink = cx.local.mavlink;
+        let decoder = cx.local.decoder;
         let usb_task::SharedResources {
             mut out1,
             mut out2,
@@ -775,17 +856,56 @@ mod app {
             mut prox_left,
             mut prox_right,
             mut navsol,
+            mut esc,
+            mut esc_tlm,
             ..
         } = cx.shared;
 
         let mut tick: u32 = 0;
         loop {
-            // Service the USB stack every tick (~1 ms). Discard any host->device
-            // bytes so the OUT endpoint never stalls.
+            // Service the USB stack every tick (~1 ms). Decode any host->device
+            // bytes as inbound MAVLink commands so the OUT endpoint never stalls.
             usb_dev.poll(&mut [serial]);
             {
                 let mut scratch = [0u8; 64];
-                let _ = serial.read(&mut scratch);
+                if let Ok(n) = serial.read(&mut scratch) {
+                    let now = Mono::now().ticks() as u32;
+                    for &b in &scratch[..n] {
+                        if let Some(cmd) = decoder.push(b) {
+                            // Acknowledge every decoded command with a STATUSTEXT so
+                            // the ground station's feed shows the uplink is landing.
+                            let is_set = matches!(cmd, Inbound::EscSet { .. });
+                            let mut ack: heapless::String<50> = heapless::String::new();
+                            match &cmd {
+                                Inbound::MotorTest { motor, throttle, .. } => {
+                                    let _ = write!(ack, "ESC: motor {} test {}%", motor, *throttle as i32);
+                                }
+                                Inbound::EscSet { master_enabled, protocol, refresh_hz, .. } => {
+                                    let _ = write!(
+                                        ack,
+                                        "ESC: set master={} proto={} hz={}",
+                                        *master_enabled as u8, protocol, refresh_hz
+                                    );
+                                }
+                                Inbound::EscCmd { target, command } => {
+                                    let _ = write!(ack, "ESC: cmd {} -> tgt {}", command, target);
+                                }
+                            }
+                            esc.lock(|e| apply_inbound(e, cmd, now));
+                            let frame = mavlink.statustext(6, &ack);
+                            pump_write(usb_dev, serial, frame.as_slice());
+                            // Echo config immediately after a write so the UI sticks.
+                            if is_set {
+                                let c = esc.lock(|e| e.config);
+                                let cf = mavlink.esc_config(
+                                    c.cur_scale, c.cur_offset, c.refresh_hz, c.protocol.as_u8(),
+                                    c.master_enabled, c.bidir, c.dir_mask, c.pole_count, c.mode3d_mask,
+                                );
+                                pump_write(usb_dev, serial, cf.as_slice());
+                            }
+                        }
+                    }
+                }
             }
 
             // Only write when fully configured; timekeeping continues while the
@@ -990,6 +1110,38 @@ mod app {
                 }
             }
 
+            // ESC telemetry at 10 Hz.
+            if tick % 100 == 45 {
+                let t = esc_tlm.lock(|t| *t);
+                let frame = mavlink.esc_telem(
+                    t.mah as f32,
+                    t.total_current_a(),
+                    &t.rpm,
+                    &t.centivolt,
+                    &t.centiamp,
+                    &t.temp,
+                    &t.err,
+                );
+                pump_write(usb_dev, serial, frame.as_slice());
+            }
+
+            // ESC config echo at 1 Hz so the ground station reflects FC state.
+            if tick % 1000 == 25 {
+                let c = esc.lock(|e| e.config);
+                let frame = mavlink.esc_config(
+                    c.cur_scale,
+                    c.cur_offset,
+                    c.refresh_hz,
+                    c.protocol.as_u8(),
+                    c.master_enabled,
+                    c.bidir,
+                    c.dir_mask,
+                    c.pole_count,
+                    c.mode3d_mask,
+                );
+                pump_write(usb_dev, serial, frame.as_slice());
+            }
+
             // Spread 1 Hz status packets across the USB frame.
             if tick % 1000 == 5 {
                 let frame = mavlink.heartbeat();
@@ -1043,6 +1195,37 @@ mod app {
     /// longer than one USB packet (64 B) are written in a tight loop with a
     /// single poll() between packets; if the endpoint is still busy after
     /// draining, the remainder is dropped (a later frame will resynchronize).
+    /// Apply one decoded inbound MAVLink command to the ESC controller.
+    fn apply_inbound(e: &mut Esc, cmd: Inbound, now_ms: u32) {
+        match cmd {
+            Inbound::MotorTest { motor, throttle, timeout_s, .. } => {
+                e.start_test(motor, throttle, (timeout_s * 1000.0) as u32, now_ms);
+            }
+            Inbound::EscSet {
+                master_enabled,
+                protocol,
+                refresh_hz,
+                bidir,
+                dir_mask,
+                mode3d_mask,
+                pole_count,
+                cur_scale,
+                cur_offset,
+            } => e.apply_set(
+                master_enabled,
+                protocol,
+                refresh_hz,
+                bidir,
+                dir_mask,
+                mode3d_mask,
+                pole_count,
+                cur_scale,
+                cur_offset,
+            ),
+            Inbound::EscCmd { target, command } => e.queue_command(target, command),
+        }
+    }
+
     fn pump_write(
         usb_dev: &mut UsbDevice<'static, MyUsbBus>,
         serial: &mut usbd_serial::SerialPort<'static, MyUsbBus>,

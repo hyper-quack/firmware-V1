@@ -9,7 +9,9 @@ MAVLink 2 telemetry over USB — the foundation everything else builds on.
 > and low-pass-filters them at 1 kHz, fuses them into a stable roll/pitch/yaw
 > estimate (PX4-style complementary filter), and streams per-IMU MAVLink 2
 > telemetry over USB CDC. It is
-> **not** yet a closed-loop flight controller (no control or motor output).
+> **not** yet a closed-loop flight controller — there is bit-banged DShot motor
+> output for bench testing and ESC telemetry/config (see
+> [docs/esc-motors.md](docs/esc-motors.md)), but no rate/attitude control loop.
 >
 > The full fusion pipeline — **start here for the whole-system map** — is in
 > **[docs/sensor-fusion.md](docs/sensor-fusion.md)**; the position/velocity
@@ -403,5 +405,7 @@ devices report `connected=1` and `healthy=1`, do not move on to control.
 - [ ] FIFO burst reads + innovation-weighted IMU voting.
 - [ ] SPL06 barometer (I2C2) and the OSD/dataflash on SPI2/SPI3.
 - [ ] Full EKF2-style nav filter once baro/mag/GPS exist (see docs §8).
-- [ ] Rate controller → motor mixer → DShot/PWM output.
+- [x] Bit-banged DShot output + BLHeli32/KISS ESC telemetry + motor-test &
+      config over MAVLink ([docs/esc-motors.md](docs/esc-motors.md)).
+- [ ] Rate controller → motor mixer feeding the DShot output.
 - [ ] Swap busy-wait CDC logging for a defmt-over-RTT or framed binary link.
