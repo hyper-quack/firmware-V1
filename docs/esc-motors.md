@@ -58,11 +58,43 @@ Definitions live in [`message_definitions/scky.xml`](../message_definitions/scky
 **Out of scope:** PWM frequency, motor timing, demag, startup/ramp power — these
 live in the ESC EEPROM and require BLHeli32 4-way passthrough (not implemented).
 
+## Per-motor output model
+
+Each of the four motors is **independent**: it has its own throttle target, its
+own motor-test watchdog, and its own queue of DShot special commands. The ground
+station can spin any subset of motors at once. (Earlier the FC held a single
+"one motor at a time" test slot; when the GS re-sent several non-zero sliders the
+slot was overwritten back and forth, so concurrently-driven motors alternated on
+the wire and read as *linked / jittering / accumulating*. That is fixed.)
+
+> **Per-motor RPM is approximate.** The shared telemetry T-wire carries no motor
+> id, so decoded records are attributed round-robin (see `EscTelemetry::ingest`).
+> Treat the per-motor RPM bars as aggregate health, not a true per-motor reading.
+
+## How special commands are sent (AM32 / BLHeli_32)
+
+Direction (20/21), 3D (9/10), save (12) and beacon (1..5) are not throttle, so
+they are emitted only when these ESC-firmware preconditions are met:
+
+1. **At zero throttle.** The FC forces the target motor to stop, then emits the
+   command once it has spun down — AM32/BLHeli ignore config commands while the
+   motor is driven.
+2. **With the telemetry-request bit set.** Without it the ESC silently drops the
+   command. (This bit-banged path reads telemetry from the T-wire UART, so the
+   bit is *only* set for these special-command frames, never for throttle.)
+3. **Repeated** several frames in a row, and **queued in order** — e.g. a spin
+   direction change is `21` (or `20`) immediately followed by `12` (save); both
+   are held in a small per-motor FIFO so the first is not overwritten by the
+   second. Reversing a motor in the GS sends exactly this pair.
+
 ## Safety model
 
 1. `master_enabled` defaults to **false**; `EscConfig::frames` returns
-   `MOTOR_STOP` for every motor while it is off and cancels any running test.
+   `MOTOR_STOP` for every motor while it is off and clears all per-motor state.
 2. A motor test carries a timeout (default 3 s); the GS must re-issue
    `DO_MOTOR_TEST` to sustain a spin.
-3. Special commands (direction/3D/save) are ignored while a test is running.
-4. First bench tests: **propellers removed.**
+3. **Propellers removed** for bench tests. A propless motor has almost no inertia
+   and AM32/BLHeli stall protection will cut it well below full throttle (often
+   ~30–50 %); it then needs throttle back to zero to re-arm. That ceiling is the
+   ESC protecting the motor, not a throttle-scaling bug — throttle maps linearly
+   `0..100 % → DShot 48..2047`. With props loaded the usable range is much higher.

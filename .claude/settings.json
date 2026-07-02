@@ -24,7 +24,19 @@
       "Bash(bash -lic 'node --version && which npm')",
       "Bash(/home/poorcsky/.cache/ms-playwright-go/1.57.0/node --version)",
       "Bash(/home/poorcsky/.cache/ms-playwright-go/1.57.0/node node_modules/typescript/bin/tsc --noEmit)",
-      "Bash(echo \"=== exit: $? ===\")"
+      "Bash(echo \"=== exit: $? ===\")",
+      "Bash(timeout 300 cargo check --bin scky-fc)",
+      "Bash(timeout 300 cargo check --bins)",
+      "Bash(node -e \"console.log\\(Object.keys\\(require\\('./package.json'\\).scripts||{}\\).join\\(', '\\)\\)\")",
+      "Bash(npx --no-install tsc --noEmit)",
+      "Bash(echo \"exit:$?\")",
+      "Bash(awk '{printf \"  initial SP = 0x%s\\\\n  reset vec  = 0x%s\\\\n\",$1,$2}')",
+      "Bash(arm-none-eabi-objcopy -O binary target/thumbv7em-none-eabihf/release/h743_motor_diag h743_motor_diag.bin)",
+      "Bash(awk '{printf \"diag SP=0x%s reset=0x%s\\\\n\",$1,$2}')",
+      "Bash(arm-none-eabi-objcopy -O binary target/thumbv7em-none-eabihf/release/h743_esc_alltest h743_esc_alltest.bin)",
+      "Bash(awk '{printf \"SP=0x%s reset=0x%s\\\\n\",$1,$2}')",
+      "Bash(python3 -c \"print\\('DShot', 48 + \\(1999*12\\)//100, '=>', round\\(\\(48 + \\(1999*12\\)//100\\)/2047*100,1\\), '% of full'\\)\")",
+      "Bash(dfu-util -l)"
     ],
     "additionalDirectories": [
       "/home/poorcsky/Documents/scky_firmware/src"

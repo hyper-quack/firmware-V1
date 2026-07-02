@@ -64,7 +64,7 @@
     #[doc =
     " ESC telemetry (BLHeli32 / KISS T pad → USART3 RX / PD9). Standard is 115200."]
     const ESC_TELEM_BAUD : u32 = 115_200; const FIRMWARE_TAG : & str =
-    "scky-fc esc-usb-diag 2026-06-25"; type Imu1 = Imu < spi :: Spi < pac ::
+    "scky-fc esc-permotor 2026-06-27"; type Imu1 = Imu < spi :: Spi < pac ::
     SPI1, spi :: Enabled > , Pin < 'A', 4, Output > > ; type Imu2 = Imu < spi
     :: Spi < pac :: SPI4, spi :: Enabled > , Pin < 'B', 1, Output > > ; type
     I2c2 = i2c :: I2c < pac :: I2C2 > ; type MyUsbBus = UsbBus < USB2 > ;

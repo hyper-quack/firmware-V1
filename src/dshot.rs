@@ -52,10 +52,14 @@ pub enum Protocol {
 }
 
 impl Protocol {
+    /// Map the host's protocol byte to a rate the GPIO bit-bang can actually
+    /// clock at the 64 MHz HSI core. DShot600 (~107 cycles/bit) has too little
+    /// timing margin here — the ESC rejects every frame and won't even beacon —
+    /// so a DShot600 request is clamped down to DShot300 until a timer/DMA output
+    /// path exists. 0/anything else = DShot150 (most margin, the safe default).
     pub fn from_u8(v: u8) -> Self {
         match v {
-            1 => Protocol::Dshot300,
-            2 => Protocol::Dshot600,
+            1 | 2 => Protocol::Dshot300, // 2 (DShot600) clamped to 300, see above
             _ => Protocol::Dshot150,
         }
     }
@@ -68,14 +72,16 @@ impl Protocol {
         }
     }
 
-    /// Bit period in core clock cycles.
+    /// Bit period in core clock cycles, rounded to the nearest cycle (truncating
+    /// here biased every edge early — worst at DShot600 where the period is only
+    /// ~107 cycles).
     fn bit_cycles(self) -> u32 {
         let hz = match self {
             Protocol::Dshot150 => 150_000,
             Protocol::Dshot300 => 300_000,
             Protocol::Dshot600 => 600_000,
         };
-        CORE_HZ / hz
+        (CORE_HZ + hz / 2) / hz
     }
 }
 
@@ -117,14 +123,15 @@ pub fn init_pins() {
 
 /// Emit one DShot frame per motor on all four lines in parallel.
 ///
-/// Each bit: drive all lines high, hold `T0` (0.375·bit) for the common low part,
+/// Each bit: drive all lines high, hold `T0` (0.375·bit) for the common high part,
 /// pull low any line whose bit is 0, hold another 0.375·bit so '1' lines stay high
-/// to 0.75·bit, then pull all low for the remaining 0.25·bit. Runs with interrupts
-/// enabled (see module docs).
+/// to 0.75·bit, then pull all low for the remaining 0.25·bit. Interrupts are masked
+/// for the whole frame so no ISR can stretch a bit and make the ESC reject the
+/// packet; edges are scheduled against DWT CYCCNT (see module docs).
 pub fn send_frames(frames: &[u16; 4], proto: Protocol) {
     let bit = proto.bit_cycles();
-    let t_low = (bit * 3) / 8; // 0.375 · bit  -> high portion common to 0 and 1
-    let t_mid = (bit * 3) / 8; // extra 0.375 · bit -> '1' lines stay high to 0.75
+    let t_low = (bit * 3 + 4) / 8; // 0.375 · bit (rounded) -> high part common to 0 and 1
+    let t_mid = (bit * 3 + 4) / 8; // extra 0.375 · bit -> '1' lines stay high to 0.75
     let t_rest = bit - t_low - t_mid; // remaining ~0.25 · bit, all low
 
     // Precompute, for each of the 16 bit-times (MSB first), the BSRR reset mask of

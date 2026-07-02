@@ -120,7 +120,7 @@ mod app {
     const TFLUNA_BAUD: u32 = 115_200;
     /// ESC telemetry (BLHeli32 / KISS T pad → USART3 RX / PD9). Standard is 115200.
     const ESC_TELEM_BAUD: u32 = 115_200;
-    const FIRMWARE_TAG: &str = "scky-fc esc-usb-diag 2026-06-25";
+    const FIRMWARE_TAG: &str = "scky-fc esc-permotor 2026-06-27";
 
     // ---- Concrete types for the two IMU instances -------------------------
     type Imu1 = Imu<spi::Spi<pac::SPI1, spi::Enabled>, Pin<'A', 4, Output>>;
