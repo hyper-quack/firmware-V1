@@ -1,21 +1,28 @@
-# scky-fc — RTIC Flight-Controller Firmware (STM32H743 / DAKEFPVH743)
+# CSky-fc — RTIC Flight-Controller Firmware (STM32H743 / DAKEFPVH743)
 
 A from-scratch, [RTIC](https://rtic.rs)-based flight-controller firmware in Rust
 for the **DAKEFPV H743** flight controller, intended to eventually replace
 ArduPilot on this hardware. This first drop brings up the board, both IMUs, and
 MAVLink 2 telemetry over USB — the foundation everything else builds on.
 
-> **Status: Milestone 1 + attitude estimation.** It probes both IMUs, samples
-> and low-pass-filters them at 1 kHz, fuses them into a stable roll/pitch/yaw
-> estimate (PX4-style complementary filter), and streams per-IMU MAVLink 2
-> telemetry over USB CDC. It is
-> **not** yet a closed-loop flight controller — there is bit-banged DShot motor
-> output for bench testing and ESC telemetry/config (see
-> [docs/esc-motors.md](docs/esc-motors.md)), but no rate/attitude control loop.
+> **Status: closed-loop attitude control, mag/baro/GPS-fused nav, ESC telemetry.**
+> Both IMUs are probed, sampled and low-pass-filtered at 1 kHz, and fused into a
+> Mahony attitude estimate with magnetometer-corrected absolute yaw (hard/soft-iron
+> cal + declination). A geometric SO(3) rate/attitude controller — in the
+> host-tested [`control/`](control/) crate, wired to the firmware in
+> [src/control.rs](src/control.rs) — turns pilot RC input into per-motor DShot
+> commands through arming/RC-failsafe interlocks, and can hold position/velocity
+> once the EKF (fusing baro, GPS, and optical flow) has converged. ESC
+> telemetry/config, pack-voltage sensing, dual side-lidar proximity, and MAVLink 2
+> telemetry over USB CDC round out the stack. The control law and sensor fusion
+> are bench- and host-tested in isolation; full attitude/position-hold flight
+> testing on hardware is the next milestone (see the Roadmap in §13).
 >
 > The full fusion pipeline — **start here for the whole-system map** — is in
 > **[docs/sensor-fusion.md](docs/sensor-fusion.md)**; the position/velocity
-> navigation filter is in **[docs/ekf.md](docs/ekf.md)**.
+> navigation filter is in **[docs/ekf.md](docs/ekf.md)**; the control law lives in
+> [control/](control/) (see [src/control.rs](src/control.rs) for the firmware-side
+> wiring and arming/failsafe logic).
 > The platform receive schema is documented in
 > **[docs/mavlink-telemetry.md](docs/mavlink-telemetry.md)**.
 
@@ -171,9 +178,34 @@ scky_firmware/
 │   ├── imu.rs            # InvenSense v3 SPI driver (probe/config/read)
 │   ├── filters.rs        # PX4-style 2nd-order low-pass + notch filters
 │   ├── ahrs.rs           # Mahony quaternion complementary attitude filter
-│   └── estimator.rs      # mount rotation + dual-IMU combine + fusion driver
+│   ├── estimator.rs      # mount rotation + dual-IMU combine + mag-fused yaw
+│   ├── compass.rs        # QMC/HMC magnetometer + hard/soft-iron calibration
+│   ├── baro.rs           # SPL06 barometer driver
+│   ├── gps.rs            # uBlox NEO-M8N NMEA parser
+│   ├── mtf01.rs          # MTF-01 optical-flow + lidar (MSP)
+│   ├── tfluna.rs         # TF-Luna side-proximity lidar driver
+│   ├── nav.rs            # flow dead-reckoning
+│   ├── ekf.rs            # position/velocity nav filter (baro/GPS/flow)
+│   ├── control.rs        # closed-loop control glue: RC → scky_control → mixer
+│   ├── crsf.rs           # ExpressLRS CRSF RC receiver parser
+│   ├── esc.rs            # DShot motor output
+│   ├── esc_telem.rs      # BLHeli32/KISS ESC telemetry ingest
+│   ├── pwm.rs            # motor PWM/DShot timer output
+│   ├── battery.rs        # VBAT ADC sense + cell-count/SoC estimate
+│   └── mavlink.rs        # MAVLink 2 encode/decode + telemetry streaming
+├── control/              # scky_control: host-tested SO(3) controller crate
+│   └── src/
+│       ├── controller.rs # geometric rate/attitude control law
+│       ├── mixer.rs      # wrench → per-motor DShot mixing
+│       ├── rc.rs         # RC channel → control-target mapping
+│       ├── safety.rs     # tilt/rate limits, arming safety envelope
+│       ├── trajectory.rs # position/velocity target generation
+│       └── frame.rs      # AHRS/EKF state → controller state conversion
 ├── docs/
 │   └── sensor-fusion.md  # the filtering + fusion math, and PX4 mapping
+│       (see also ekf.md, esc-motors.md, compass-cal.md, baro-spl06.md,
+│        gps-compass.md, mtf01-elrs.md, proximity-tfluna.md, pin-mapping.md,
+│        mavlink-telemetry.md)
 └── README.md
 ```
 
@@ -401,11 +433,25 @@ devices report `connected=1` and `healthy=1`, do not move on to control.
 ## 13. Roadmap
 
 - [x] Per-IMU low-pass filtering + dual-IMU combine + Mahony attitude estimator.
-- [ ] Magnetometer fusion for absolute yaw; gyro/accel calibration & temp-comp.
-- [ ] FIFO burst reads + innovation-weighted IMU voting.
-- [ ] SPL06 barometer (I2C2) and the OSD/dataflash on SPI2/SPI3.
-- [ ] Full EKF2-style nav filter once baro/mag/GPS exist (see docs §8).
+- [x] Magnetometer fusion for absolute yaw — hard/soft-iron calibration +
+      declination compensation ([docs/compass-cal.md](docs/compass-cal.md)).
+- [ ] Gyro/accel bias calibration & temperature compensation.
+- [ ] FIFO burst reads + innovation-weighted dual-IMU voting (currently
+      register-polled with a simple combine).
+- [x] SPL06 barometer on I2C2 ([docs/baro-spl06.md](docs/baro-spl06.md)).
+- [ ] OSD/dataflash on SPI2/SPI3 (wired in the hwdef, not yet driven).
+- [x] EKF nav filter fusing baro/GPS/optical-flow for position & velocity
+      ([docs/ekf.md](docs/ekf.md)).
 - [x] Bit-banged DShot output + BLHeli32/KISS ESC telemetry + motor-test &
       config over MAVLink ([docs/esc-motors.md](docs/esc-motors.md)).
-- [ ] Rate controller → motor mixer feeding the DShot output.
+- [x] Geometric SO(3) rate/attitude controller → motor mixer feeding the DShot
+      output, with RC arming/failsafe interlocks and optional EKF-backed
+      position-hold ([control/](control/), wired in [src/control.rs](src/control.rs)).
+- [x] Battery pack-voltage sense + Betaflight-style cell-count / state-of-charge
+      estimate ([src/battery.rs](src/battery.rs)); coulomb counting from a live
+      current sensor is still open.
+- [x] Dual side TF-Luna proximity lidars + MTF-01 flow/height lidar for
+      collision-avoidance ranging and flow dead-reckoning.
 - [ ] Swap busy-wait CDC logging for a defmt-over-RTT or framed binary link.
+- [ ] Attitude and position-hold flight testing on hardware — the control law
+      and mixer are host-tested in `control/` but not yet flown.
